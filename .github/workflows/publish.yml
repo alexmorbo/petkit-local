@@ -26,6 +26,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 # The built-in GITHUB_TOKEN can push to ghcr.io/<owner>/* once it is allowed to.
 # No PAT and no repository secret is involved.
