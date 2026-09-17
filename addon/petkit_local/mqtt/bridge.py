@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterable
 
 from petkit_local.devices import payloads
 from petkit_local.devices.registry import DeviceRegistry
+from petkit_local.http.handlers.feed import render_feed
 from petkit_local.devices.state_parsers import apply_consumable_state, normalize_property_params
 from petkit_local.ha.categories import get_setting_fields
 from petkit_local.events import codes, ingest
@@ -637,7 +638,14 @@ class MQTTBridge:
             return {"result": sched} if sched is not None else None
         if data_type == "dev_feed_get":
             feed = device.config.get("feed_schedule")
-            return {"result": feed} if feed is not None else None
+            if feed is None:
+                return None
+            if not isinstance(feed, dict):
+                return {"result": feed}
+            # LOCAL PATCH: the same body the HTTP handler serves — live
+            # `latest`/`nextTick`, and the single-`a` meal shape for a D4H —
+            # rather than the stored dict verbatim.
+            return {"result": render_feed(device, feed, time.time())}
         if data_type == "dev_ble_device":
             # Deliberately identical to `http/handlers/ble_device.py` — the two
             # answer the same question over different transports and have

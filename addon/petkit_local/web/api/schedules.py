@@ -17,17 +17,9 @@ from aiohttp import web
 from petkit_local.devices import defaults
 from petkit_local.devices.base import encode_multi_range
 from petkit_local.ha.commands import PROPERTY_SET_SUFFIX, make_mqtt_property_set
-from petkit_local.http.handlers.feed import _build_latest, _compute_next_tick
+from petkit_local.http.handlers.feed import render_feed
 from petkit_local.utils.coerce import to_int
 from petkit_local.web.api._common import _deliver, _device_or_404, _json_body
-
-#: LOCAL PATCH (morbo): the single-hopper D4H feeding schedule carries one
-#: `a` (amount = portions x10) per meal on the wire, not the D4SH `a1`/`a2`
-#: pair. Same fix as http/handlers/feed.py (captured api-ru.petkit.cn
-#: 2026-09-16). This keeps the live MQTT `property.set{feed}` push correct so
-#: a D4H applies a schedule edit without a reboot, like the real cloud does.
-_SINGLE_HOPPER_FEEDERS = {"d4h"}
-_D4H_AMOUNT_PER_PORTION = 10
 
 
 #: Minutes in a day. A schedule range runs 0..1440 inclusive — 1440 is the end
@@ -245,27 +237,9 @@ async def api_save_schedule(request: web.Request) -> web.Response:
         d.config["feed_schedule"] = feed
         reg.save()
         _push_feed_get(d, hub, bridge, feed)
-        now = time.time()
-        latest = _build_latest(feed, now)
-        # LOCAL PATCH: single-hopper D4H wants one `a` per meal, not a1/a2.
-        _single = (getattr(d, "device_type", "") or "").lower() in _SINGLE_HOPPER_FEEDERS
-
-        def _wire_items(items):
-            if _single:
-                return [{"id": it.get("id"), "t": it.get("t"),
-                         "a": int(it.get("a1") or 0) * _D4H_AMOUNT_PER_PORTION}
-                        for it in items or []]
-            return [{"id": it.get("id"), "t": it.get("t"),
-                     "a1": it.get("a1", 0), "a2": it.get("a2", 0)}
-                    for it in items or []]
-
-        wire_groups = [{"re": g.get("re", ""), "it": _wire_items(g.get("it"))}
-                       for g in feed.get("schedule", [])]
-        wire = {
-            "schedule": wire_groups,
-            "nextTick": _compute_next_tick(latest),
-            "latest": _wire_items(latest),
-        }
+        # LOCAL PATCH: one renderer for every feed emitter, so a single-hopper
+        # D4H gets its scalar `a` here exactly as `dev_feed_get` serves it.
+        wire = render_feed(d, feed, time.time(), item_json=False)
         mqtt_cmd = make_mqtt_property_set(
             {"feed": json.dumps(wire, separators=(",", ":"))})
         return await _deliver(hub, bridge, d, PROPERTY_SET_SUFFIX, mqtt_cmd)
