@@ -426,17 +426,47 @@ async def test_all_iot_device_info_endpoints_return_ali_wrapped():
     """The cloud returns ``{result: {ali: {...}}}`` for every device, including
     those calling ``dev_iot_device_info`` (confirmed on a D4SH capture). The
     previous flat format was an assumption from localkit that no capture
-    supported."""
+    supported.
+
+    LOCAL PATCH (homelab): upstream ran this against a ``t4``. This fork hands
+    the ESP32 litter boxes (``t3``/``t4``) the flat block instead — see
+    ``_ESP32_FLAT_PAYLOAD_TYPES`` and the next test — so the wrapped assertion
+    is made against a ``d4``: non-next-gen, but not in that set, which must
+    stay exactly what upstream serves."""
     reg = DeviceRegistry()
     client = await _client(reg)
     try:
-        await client.post("/6/t4/dev_signup", headers=HDR)
+        await client.post("/6/d4/dev_signup", headers=HDR)
         for ep in ("dev_iot_device_info", "dev_only_iot_device_info_v2"):
-            r = await client.post(f"/6/t4/{ep}", headers=HDR)
+            r = await client.post(f"/6/d4/{ep}", headers=HDR)
             res = (await r.json())["result"]
             assert "ali" in res, f"{ep} should return ali-wrapped"
             ali = res["ali"]
             assert ali["productKey"] and ali["deviceSecret"] and ali["mqttHost"]
+    finally:
+        await client.close()
+
+
+async def test_esp32_litter_boxes_get_the_flat_credential_block():
+    """LOCAL PATCH (homelab): a T4 handed the wrapped block ran its whole init
+    over HTTP and never opened MQTT; the flat block fixed it, live. Only
+    ``t3``/``t4`` are flattened — the wrapped shape stays for everything else,
+    including the ESP32 feeders and the next-gen models."""
+    reg = DeviceRegistry()
+    client = await _client(reg)
+    try:
+        for dt in ("t3", "t4"):
+            hdr = {"X-Device": f"id=10{dt[1]}&sn=SN{dt}"}
+            await client.post(f"/6/{dt}/dev_signup", headers=hdr)
+            for ep in ("dev_iot_device_info", "dev_only_iot_device_info_v2"):
+                r = await client.post(f"/6/{dt}/{ep}", headers=hdr)
+                res = (await r.json())["result"]
+                assert "ali" not in res, f"{dt} {ep} should be flat"
+                assert res["productKey"] and res["deviceSecret"]
+                assert res["mqttHost"] == "server"
+        await client.post("/6/t5/dev_signup", headers=HDR)
+        r = await client.post("/6/t5/dev_iot_device_info", headers=HDR)
+        assert "ali" in (await r.json())["result"]
     finally:
         await client.close()
 
