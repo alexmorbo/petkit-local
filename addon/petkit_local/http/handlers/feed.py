@@ -39,6 +39,15 @@ _EMPTY_GROUP = {"re": "1,2,3,4,5,6,7", "it": [], "itemJsonString": "[]"}
 #: alphabetical order (``a1``, ``a2``, ``id``, ``t``), no whitespace.
 _ITEM_JSON = dict(separators=(",", ":"), sort_keys=True)
 
+#: LOCAL PATCH (morbo): the single-hopper D4H schedule item carries a single
+#: `a` (amount), not the D4SH's `a1`/`a2` pair. Confirmed against a live
+#: api-ru.petkit.cn D4H capture 2026-09-16: {"id":"n_55140","t":55140,"a":20},
+#: same `a` in latest[]. `a` is portions x10 (a=10 -> 1 portion; the device
+#: divides by its own constant, as the manual feed path does with `amount`).
+#: Storage stays in `a1` (portions); the translation happens only on the wire.
+_SINGLE_HOPPER_FEEDERS = {"d4h"}
+_D4H_AMOUNT_PER_PORTION = 10
+
 
 def _local_midnight(now: float, day_offset: int) -> float:
     """Local midnight ``day_offset`` days after the day containing ``now``.
@@ -154,6 +163,11 @@ async def handle_feed_get(request: web.Request) -> web.Response:
     Returns:
         ``{"result": {"schedule": [...], "nextTick": N, "latest": [...]}}``.
         Structure matches the real cloud's response 1:1.
+
+    LOCAL PATCH: a single-hopper D4H is served a single ``a`` per meal instead
+    of the D4SH ``a1``/``a2`` pair (see ``_SINGLE_HOPPER_FEEDERS``). Everything
+    else — grouping, ids, ``t``, ``itemJsonString`` key order, ``latest`` and
+    ``nextTick`` — is unchanged. Non-D4H devices take the original path verbatim.
     """
     device = request_device(request)
 
@@ -177,14 +191,38 @@ async def handle_feed_get(request: web.Request) -> web.Response:
     latest = _build_latest(feed, now)
     next_tick = _compute_next_tick(latest)
 
-    for group in feed.get("schedule", []):
-        if "it" in group:
-            group["itemJsonString"] = json.dumps(group["it"], **_ITEM_JSON)
+    if (getattr(device, "device_type", "") or "").lower() not in _SINGLE_HOPPER_FEEDERS:
+        for group in feed.get("schedule", []):
+            if "it" in group:
+                group["itemJsonString"] = json.dumps(group["it"], **_ITEM_JSON)
+        return web.json_response({
+            "result": {
+                "schedule": feed.get("schedule", [_EMPTY_GROUP]),
+                "nextTick": next_tick,
+                "latest": latest,
+            }
+        })
+
+    # Single-hopper D4H: emit `a` (= a1 portions x _D4H_AMOUNT_PER_PORTION).
+    def _wire(item: dict) -> dict:
+        return {"id": item.get("id"), "t": item.get("t"),
+                "a": int(item.get("a1") or 0) * _D4H_AMOUNT_PER_PORTION}
+
+    schedule_out = []
+    for group in feed.get("schedule", []) or []:
+        items = [_wire(it) for it in group.get("it") or []]
+        schedule_out.append({
+            "re": group.get("re", ""),
+            "it": items,
+            "itemJsonString": json.dumps(items, **_ITEM_JSON),
+        })
+    if not schedule_out:
+        schedule_out = [_EMPTY_GROUP]
 
     return web.json_response({
         "result": {
-            "schedule": feed.get("schedule", [_EMPTY_GROUP]),
+            "schedule": schedule_out,
             "nextTick": next_tick,
-            "latest": latest,
+            "latest": [_wire(entry) for entry in latest],
         }
     })
