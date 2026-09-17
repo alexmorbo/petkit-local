@@ -173,10 +173,16 @@ function renderFeedEditor(id, t, value) {
   const groups = Array.isArray(value.schedule) ? value.schedule : [];
   const dat = ` data-id="${esc(id)}" data-target="${esc(t.target)}"`;
   const add = `<button class="link"${dat} data-action="sched-add-feed-group">+ Add days</button>`;
+  // A single-hopper YumShare is served one amount per meal — `a`, portions
+  // times ten — while this editor counts portions. The Raw JSON box below
+  // shows the served shape, so the two are named as one number here.
+  const note = t.single
+    ? `<p class="sub">Served to the feeder as one amount per meal, <code>a</code> = portions × 10 — the Raw JSON below shows that shape.</p>`
+    : '';
   if (!groups.length)
-    return `<p class="sub">No meals set — the feeder dispenses only when you press Feed.</p>${add}`;
+    return `${note}<p class="sub">No meals set — the feeder dispenses only when you press Feed.</p>${add}`;
 
-  return `${groups
+  return `${note}${groups
     .map(
       (group, gi) => `<div class="sched-entry">
       <div class="sched-row">

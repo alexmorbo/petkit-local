@@ -9,6 +9,7 @@ times, told apart only by `type`, so an editor that rewrites its own section has
 to keep the other one.
 """
 import json
+import time
 
 import pytest
 
@@ -548,3 +549,105 @@ def test_only_a_dual_hopper_is_offered_two_portions():
         # And every feeder gets the object shape, so the editor has something
         # to render before any meal exists.
         assert target["value"] == {"schedule": []}
+
+
+# --- LOCAL PATCH: the Raw JSON box shows a D4H what it is served ------------
+# A single-hopper D4H stores `a1` portions (what the Portions editor reads)
+# and is served one `a` = portions x10 per meal (`feed.render_feed`). The
+# raw-JSON text entity is labelled "what the device is actually served", so
+# for a D4H it shows the served shape; a Dual-Hopper's stays storage, exactly.
+
+def _feed_box(detail):
+    return next(e for e in detail["entities"] if e["key"] == "feeding_schedule")["value"]
+
+
+def _feed_editor(detail):
+    return next(t for t in detail["schedules"] if t["target"] == "feed_schedule")
+
+
+async def test_d4h_raw_json_shows_the_served_single_amount_and_the_editor_keeps_portions():
+    app, reg, bridge = _panel("d4h")
+    c = await _client(app)
+    try:
+        status, _ = await _save(c, "feed_schedule", {"schedule": [
+            {"re": "1,2,3,4,5,6,7", "it": [{"t": 55140, "a1": 2, "a2": 0}]}]})
+        assert status == 200
+        detail = await (await c.get("/api/devices/1")).json()
+        box = _feed_box(detail)
+        assert box["schedule"][0]["it"][0] == {"id": "n_55140", "t": 55140, "a": 20}
+        assert box["schedule"][0]["itemJsonString"] == '[{"a":20,"id":"n_55140","t":55140}]'
+        assert box["v"] == 2
+        editor = _feed_editor(detail)
+        assert editor["value"]["schedule"][0]["it"][0]["a1"] == 2
+        assert editor["single"] is True and editor["dual"] is False
+        # storage is untouched by the view
+        assert reg.get(1).config["feed_schedule"]["schedule"][0]["it"][0]["a1"] == 2
+        # and the device was pushed the same single amount the box shows
+        wire = json.loads(bridge.sent[0][2]["params"]["feed"])
+        assert wire["schedule"][0]["it"][0] == {"id": "n_55140", "t": 55140, "a": 20}
+    finally:
+        await c.close()
+
+
+async def test_d4sh_raw_json_and_wire_are_the_stored_shape_unchanged():
+    app, reg, bridge = _panel("d4sh")
+    c = await _client(app)
+    try:
+        payload = {"schedule": [{"re": "5", "it": [
+            {"id": "n_46560", "t": 46560, "a1": 1, "a2": 6}]}]}
+        status, _ = await _save(c, "feed_schedule", payload)
+        assert status == 200
+        stored = reg.get(1).config["feed_schedule"]
+        detail = await (await c.get("/api/devices/1")).json()
+        box = _feed_box(detail)
+        assert json.dumps(box, sort_keys=True) == json.dumps(stored, sort_keys=True)
+        assert box["schedule"][0]["it"][0] == {"id": "n_46560", "t": 46560, "a1": 1, "a2": 6}
+        assert _feed_editor(detail)["single"] is False
+        wire = json.loads(bridge.sent[0][2]["params"]["feed"])
+        assert wire["schedule"] == [{"re": "5", "it": [
+            {"id": "n_46560", "t": 46560, "a1": 1, "a2": 6}]}]
+        # `a` is the D4H's field; a Dual-Hopper save carrying it is refused
+        status, _ = await _save(c, "feed_schedule",
+                                {"schedule": [{"re": "1", "it": [{"t": 100, "a": 20}]}]})
+        assert status == 400
+        assert reg.get(1).config["feed_schedule"] == stored
+    finally:
+        await c.close()
+
+
+async def test_d4h_single_amount_round_trips_through_both_save_paths():
+    """The served `a` pasted back — through the editor's save (the cleaner)
+    or the Raw JSON box (the text entity) — lands in storage as `a1` portions,
+    the editor reads it as such, and the device is pushed `a` again."""
+    app, reg, bridge = _panel("d4h")
+    c = await _client(app)
+    try:
+        status, _ = await _save(c, "feed_schedule",
+                                {"schedule": [{"re": "1", "it": [{"t": 100, "a": 25}]}]})
+        assert status == 200
+        assert reg.get(1).config["feed_schedule"]["schedule"][0]["it"][0] == \
+            {"id": "n_100", "t": 100, "a1": 2, "a2": 0}
+        wire = json.loads(bridge.sent[-1][2]["params"]["feed"])
+        assert wire["schedule"][0]["it"][0]["a"] == 20
+
+        raw = json.dumps({"schedule": [
+            {"re": "1", "it": [{"id": "n_200", "t": 200, "a": 30}],
+             "itemJsonString": '[{"a":30,"id":"n_200","t":200}]'}],
+            "deferred": [{"id": "d_20260918_100", "a": 10, "fire_at": time.time() + 3600}],
+            "v": 2})
+        r = await c.post("/api/devices/1/command",
+                         data=json.dumps({"entity": "feeding_schedule", "value": raw}))
+        assert r.status == 200, await r.text()
+        stored = reg.get(1).config["feed_schedule"]
+        assert stored["schedule"][0]["it"][0] == {"id": "n_200", "t": 200, "a1": 3}
+        assert stored["schedule"][0]["itemJsonString"] == '[{"a1":3,"id":"n_200","t":200}]'
+        assert stored["deferred"][0]["a1"] == 1 and "a" not in stored["deferred"][0]
+        wire = json.loads(bridge.sent[-1][2]["params"]["feed"])
+        assert wire["schedule"][0]["it"][0] == {"id": "n_200", "t": 200, "a": 30}
+        assert [e["a"] for e in wire["latest"]] == [10]
+
+        detail = await (await c.get("/api/devices/1")).json()
+        assert _feed_editor(detail)["value"]["schedule"][0]["it"][0]["a1"] == 3
+        assert _feed_box(detail)["schedule"][0]["it"][0]["a"] == 30
+    finally:
+        await c.close()

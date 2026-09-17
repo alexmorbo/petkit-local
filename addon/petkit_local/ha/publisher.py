@@ -26,6 +26,7 @@ import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from petkit_local.http.handlers.feed import feed_schedule_view
 from petkit_local.devices import defaults
 from petkit_local.devices.base import Device
 from petkit_local.devices.registry import DeviceRegistry
@@ -543,13 +544,16 @@ class HAPublisher:
         # had exactly one key and the defaults were no longer consulted.
         settings = {**defaults.default_settings(device),
                     **(device.config.get("settings") or {})}
-        # `schedule`/`feed_schedule` back the raw-JSON text entities.
+        # `schedule`/`feed_schedule` back the raw-JSON text entities. The feed
+        # one is the SERVED view: a D4H stores `a1` portions and is served a
+        # single `a` (`feed.feed_schedule_view`, same as the web panel).
         enabled = device.enabled_capabilities()
         return {
             "state": state,
             "settings": settings,
             "schedule": json.dumps(device.config.get("schedule", [])),
-            "feed_schedule": json.dumps(device.config.get("feed_schedule", {})),
+            "feed_schedule": json.dumps(feed_schedule_view(
+                device, device.config.get("feed_schedule", {}), time.time())),
             "capabilities": {ct: (ct in enabled) for ct in Device.CAPABILITY_TYPES},
             "local": {**LOCAL_DEFAULTS, **(device.config.get("local") or {})},
         }

@@ -11,6 +11,7 @@ for anything scripting the API, and share their bodies with the detail.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
@@ -23,6 +24,7 @@ from petkit_local.ha.commands import (
     ALL_ACTIONS, PROPERTY_SET_SUFFIX, Refused, handle_ha_command,
     make_mqtt_property_set,
 )
+from petkit_local.http.handlers.feed import feed_schedule_view
 from petkit_local.media.go2rtc import stream_urls_with_rtsp
 from petkit_local.mqtt.broker import delivery_view
 from petkit_local.utils.coerce import to_float
@@ -66,6 +68,11 @@ def _state_doc(d: Device) -> dict[str, Any]:
     Recomputes the consumable countdowns first, for the same reason
     `HAPublisher._build_state` does: they move with the calendar, and the N50's
     has no device input to trigger it.
+
+    `feed_schedule` is the SERVED view (`feed.feed_schedule_view`) — storage
+    for every feeder but the D4H, whose meals are stored as `a1` portions and
+    served as a single `a`. The raw-JSON text entity is labelled as what the
+    device gets, and HA's copy is built the same way.
     """
     apply_consumable_state(d)
     settings = d.config.get("settings") or {}
@@ -74,7 +81,7 @@ def _state_doc(d: Device) -> dict[str, Any]:
         "state": d.state or {},
         "settings": settings,
         "schedule": d.config.get("schedule", []),
-        "feed_schedule": d.config.get("feed_schedule", {}),
+        "feed_schedule": feed_schedule_view(d, d.config.get("feed_schedule", {}), time.time()),
         "capabilities": {ct: (ct in enabled) for ct in d.CAPABILITY_TYPES},
     }
 
