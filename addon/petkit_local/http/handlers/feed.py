@@ -30,6 +30,7 @@ from aiohttp import web
 
 from petkit_local.http.handlers._common import request_device
 from petkit_local.utils.coerce import to_int
+from petkit_local.utils.const import DEVICE_TYPES_FEEDER_SINGLE_AMOUNT
 
 #: What the cloud returns for ``nextTick`` when ``latest`` is empty — the
 #: constant 86340 (23h59m) in every such capture, never a computed value.
@@ -50,7 +51,7 @@ _ITEM_JSON = dict(separators=(",", ":"), sort_keys=True)
 #: and `render_feed` below is the ONE place it happens — every emitter of a
 #: feed schedule (HTTP `dev_feed_get`, the MQTT `data_get` answer, and both
 #: `property.set{feed}` pushes) goes through it, so the shapes cannot drift.
-_SINGLE_HOPPER_FEEDERS = {"d4h"}
+_SINGLE_HOPPER_FEEDERS = DEVICE_TYPES_FEEDER_SINGLE_AMOUNT
 _D4H_AMOUNT_PER_PORTION = 10
 #: The firmware keeps feed amounts in a single byte (`sb`, see
 #: `ha/commands.py::_feed`); anything above wraps on the device.
@@ -198,6 +199,80 @@ def _single_hopper_amount(item: dict) -> int:
 def _single_hopper_item(item: dict) -> dict:
     return {"id": item.get("id"), "t": item.get("t"),
             "a": _single_hopper_amount(item)}
+
+
+def single_hopper_portions(item: dict) -> int | None:
+    """A D4H meal's portions — the stored ``a1`` — from either shape it arrives in.
+
+    ``a1`` is portions, as the panel and the cleaner store it. The wire's ``a``
+    is portions x10, so a meal pasted back from the served JSON maps
+    ``a // 10``; a remainder is dropped, since the device is only ever served
+    whole portions. None when neither field is readable.
+    """
+    a1 = to_int(item.get("a1"), None)
+    if a1 is not None:
+        return a1
+    a = to_int(item.get("a"), None)
+    return None if a is None else a // _D4H_AMOUNT_PER_PORTION
+
+
+def normalize_single_hopper_feed(feed: dict) -> bool:
+    """Rewrite wire-shaped D4H meals (``a``) in ``feed`` to the stored ``a1``.
+
+    Storage holds portions in ``a1`` so the panel's Portions editor and the
+    served ``a`` are two views of one number. A raw JSON save — the panel's
+    Raw JSON box and HA's text entity both store what they are given — can
+    carry the served shape back; this puts it in the stored one, in the
+    schedule groups and in ``deferred`` alike. A meal that already has ``a1``
+    is left as it is. ``itemJsonString`` is rebuilt on a group that changed,
+    so the two copies do not disagree. Returns whether anything changed.
+    """
+    changed = False
+    groups = feed.get("schedule")
+    groups = [g for g in groups if isinstance(g, dict)] if isinstance(groups, list) else []
+    deferred = feed.get("deferred")
+    deferred = deferred if isinstance(deferred, list) else []
+
+    def _to_stored(item) -> bool:
+        if not isinstance(item, dict) or "a" not in item:
+            return False
+        if to_int(item.get("a1"), None) is None:
+            portions = single_hopper_portions(item)
+            if portions is None:
+                return False
+            item["a1"] = portions
+        del item["a"]
+        return True
+
+    for group in groups:
+        meals = group.get("it")
+        if not isinstance(meals, list):
+            continue
+        if any([_to_stored(it) for it in meals]):
+            changed = True
+            if "itemJsonString" in group:
+                group["itemJsonString"] = json.dumps(
+                    [it for it in meals if isinstance(it, dict)], **_ITEM_JSON)
+    for entry in deferred:
+        if _to_stored(entry):
+            changed = True
+    return changed
+
+
+def feed_schedule_view(device, feed, now: float):
+    """What the device is served, for the panel's and HA's raw-JSON text entity.
+
+    Storage itself for every feeder but the D4H — byte-identical to what those
+    entities have always shown. A D4H is served single-``a`` meals
+    (`render_feed`) while storing ``a1`` portions, so its text entity would
+    otherwise show a shape the device never sees under a label saying it does.
+    Only ``schedule`` is swapped for the served groups; ``v`` and ``deferred``
+    stay as stored, so saving the box's contents back round-trips through
+    `normalize_single_hopper_feed` without losing a deferred feed.
+    """
+    if not isinstance(feed, dict) or not is_single_hopper(device):
+        return feed
+    return {**feed, "schedule": render_feed(device, feed, now)["schedule"]}
 
 
 def render_feed(device, feed: dict, now: float, *, item_json: bool = True) -> dict:

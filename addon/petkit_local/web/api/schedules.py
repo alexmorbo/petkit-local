@@ -17,7 +17,7 @@ from aiohttp import web
 from petkit_local.devices import defaults
 from petkit_local.devices.base import encode_multi_range
 from petkit_local.ha.commands import PROPERTY_SET_SUFFIX, make_mqtt_property_set
-from petkit_local.http.handlers.feed import render_feed
+from petkit_local.http.handlers.feed import is_single_hopper, render_feed, single_hopper_portions
 from petkit_local.utils.coerce import to_int
 from petkit_local.web.api._common import _deliver, _device_or_404, _json_body
 
@@ -128,7 +128,7 @@ def _clean_point_list(value: Any) -> list[dict[str, Any]] | None:
     return cleaned
 
 
-def _clean_feed_schedule(value: Any) -> dict[str, Any] | None:
+def _clean_feed_schedule(value: Any, *, single_hopper: bool = False) -> dict[str, Any] | None:
     """`{schedule: [{re, it, itemJsonString}], nextTick, latest}` — the feeder's.
 
     The shape comes from a D4SH 867 `ctrl` (`pk_schmg_parse_schedule`), which
@@ -144,6 +144,12 @@ def _clean_feed_schedule(value: Any) -> dict[str, Any] | None:
     alphabetical. `nextTick` and `latest` are recomputed at serve time, and the
     `v: 2` stamp marks the schedule as seconds-based so the one-time minute
     migration (`feed.migrate_minute_schedule`) never touches a current save.
+
+    LOCAL PATCH: with ``single_hopper`` a meal may instead carry the D4H's
+    wire ``a`` (portions x10), which is what the panel's Raw JSON box shows for
+    one; it is stored as ``a1 = a // 10`` (`feed.single_hopper_portions`). A
+    Dual-Hopper never reads ``a``, so for it the field stays unknown and the
+    meal is refused as before.
     """
     if not isinstance(value, dict):
         return None
@@ -170,6 +176,8 @@ def _clean_feed_schedule(value: Any) -> dict[str, Any] | None:
                 return None
             second_of_day = to_int(meal.get("t"), None)
             first = to_int(meal.get("a1"), None)
+            if first is None and single_hopper:
+                first = single_hopper_portions(meal)
             second = to_int(meal.get("a2"), 0)
             if second_of_day is None or first is None or second is None:
                 return None
@@ -231,7 +239,7 @@ async def api_save_schedule(request: web.Request) -> web.Response:
     raw = body.get("value")
 
     if kind == "feed":
-        feed = _clean_feed_schedule(raw)
+        feed = _clean_feed_schedule(raw, single_hopper=is_single_hopper(d))
         if feed is None:
             return web.json_response({"error": "not a valid feeding schedule"}, status=400)
         d.config["feed_schedule"] = feed

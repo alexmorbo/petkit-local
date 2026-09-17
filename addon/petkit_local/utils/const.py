@@ -44,6 +44,14 @@ DEVICE_TYPES_FEEDER = {"feeder", "feedermini", "d3", "d4", "d4s", "d4h", "d4sh"}
 # was -- see `ha/commands.py::_feed`.
 DEVICE_TYPES_FEEDER_DUAL = {"d4sh"}
 
+# LOCAL PATCH (homelab): feeders whose schedule meal carries ONE amount on the
+# wire -- `a`, portions x10 -- rather than the D4SH `a1`/`a2` pair. Captured
+# from api-ru.petkit.cn talking to a D4H (2026-09-16); the translation from the
+# stored `a1` lives in `http/handlers/feed.py::render_feed`. Here rather than
+# there so the panel (`devices/defaults.py`) can say so without importing the
+# HTTP layer.
+DEVICE_TYPES_FEEDER_SINGLE_AMOUNT = {"d4h"}
+
 # Feeders running the embedded-Linux `ctrl` we have read (the D4SH 867 image
 # serves both D4SH and D4H). Everything taken from that disassembly is gated on
 # this set rather than applied to every feeder: the ESP32 models (D4, D3,

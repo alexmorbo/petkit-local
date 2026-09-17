@@ -29,7 +29,9 @@ from petkit_local.events import codes
 from petkit_local.ha.discovery import EntityDef
 from petkit_local.utils.coerce import to_bool, to_float, to_int
 from petkit_local.utils.const import DEVICE_TYPES_FEEDER_DUAL, DEVICE_TYPES_FEEDER_NEXT_GEN
-from petkit_local.http.handlers.feed import render_feed
+from petkit_local.http.handlers.feed import (
+    is_single_hopper, normalize_single_hopper_feed, render_feed,
+)
 from petkit_local.utils.timeutil import local_day_start
 
 log = logging.getLogger(__name__)
@@ -557,6 +559,11 @@ def handle_ha_command(device: Device, entity: EntityDef, payload: str) -> Comman
             # A raw save is current-format by definition — the stamp keeps the
             # one-time minute migration (feed.migrate_minute_schedule) off it.
             parsed["v"] = 2
+            # LOCAL PATCH: the text entity shows a D4H the served shape
+            # (`feed_schedule_view`), so what comes back may carry `a`; storage
+            # keeps `a1` portions, which is what the Portions editor reads.
+            if is_single_hopper(device):
+                normalize_single_hopper_feed(parsed)
             device.command_queue.append({"msgType": 1,
                                          "payload": {"feed_get": "1"},
                                          "timestamp": int(time.time())})
