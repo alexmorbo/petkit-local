@@ -243,3 +243,71 @@ def test_seconds_schedule_without_stamp_is_left_alone():
     assert migrate_minute_schedule(feed) is False
     assert feed["schedule"][0]["it"][0]["t"] == 46560
     assert feed["v"] == 2
+
+
+# --- LOCAL PATCH: the single-hopper D4H meal shape --------------------------
+# A D4H reads one scalar `a` per meal (api-ru.petkit.cn capture 2026-09-16:
+# {"id":"n_55140","t":55140,"a":20}), not the D4SH `a1`/`a2` pair. Storage
+# keeps `a1` in portions; `render_feed` scales it x10 on the wire.
+
+from petkit_local.devices.base import Device
+from petkit_local.http.handlers.feed import render_feed
+
+
+def _d4h():
+    return Device(device_type="d4h", petkit_id=2, serial_number="SN2")
+
+
+def test_d4h_meals_are_served_as_a_single_scaled_amount():
+    feed = {"v": 2, "schedule": [
+        {"re": "1,2,3,4,5,6,7", "it": [{"id": "n_55140", "t": 55140, "a1": 2, "a2": 0}]},
+    ]}
+    body = render_feed(_d4h(), feed, time.time())
+    item = body["schedule"][0]["it"][0]
+    assert item == {"id": "n_55140", "t": 55140, "a": 20}
+    assert "a1" not in item and "a2" not in item
+    assert body["schedule"][0]["itemJsonString"] == '[{"a":20,"id":"n_55140","t":55140}]'
+    for entry in body["latest"]:
+        assert set(entry) == {"id", "t", "a"}
+    # the push shape carries no itemJsonString, like the cloud's property.set
+    push = render_feed(_d4h(), feed, time.time(), item_json=False)
+    assert "itemJsonString" not in push["schedule"][0]
+    assert push["schedule"][0]["it"][0]["a"] == 20
+
+
+def test_d4h_stored_in_the_devices_own_shape_passes_a_through():
+    # `mqtt/bridge.py` stores a property-posted `feed` verbatim; a D4H's own
+    # items carry `a`, and reading only `a1` would serve every meal as 0.
+    feed = {"v": 2, "schedule": [
+        {"re": "1,2,3,4,5,6,7", "it": [{"id": "n_100", "t": 100, "a": 30}]},
+    ]}
+    body = render_feed(_d4h(), feed, time.time())
+    assert body["schedule"][0]["it"][0]["a"] == 30
+
+
+def test_d4h_amount_is_coerced_and_clamped_to_a_byte():
+    feed = {"v": 2, "schedule": [
+        {"re": "1,2,3,4,5,6,7", "it": [
+            {"id": "n_1", "t": 1, "a1": "2.0"},     # string from a raw text save
+            {"id": "n_2", "t": 2, "a1": 255},       # panel max: 2550 would wrap
+            {"id": "n_3", "t": 3, "a1": "junk"},    # unreadable -> 0, not a 500
+            "not a meal",                           # non-dict -> skipped
+        ]},
+        "not a group",
+    ]}
+    body = render_feed(_d4h(), feed, time.time())
+    amounts = [it["a"] for it in body["schedule"][0]["it"]]
+    assert amounts == [20, 255, 0]
+    assert len(body["schedule"]) == 1
+
+
+def test_dual_hopper_bytes_are_untouched_by_the_renderer():
+    feed = {"v": 2, "schedule": [
+        {"re": "5", "it": [{"id": "n_46560", "t": 46560, "a1": 1, "a2": 6}]},
+    ]}
+    dual = Device(device_type="d4sh", petkit_id=1, serial_number="SN1")
+    body = render_feed(dual, feed, time.time())
+    assert body["schedule"] is feed["schedule"]
+    assert body["schedule"][0]["itemJsonString"] == '[{"a1":1,"a2":6,"id":"n_46560","t":46560}]'
+    push = render_feed(dual, feed, time.time(), item_json=False)
+    assert push["schedule"] == [{"re": "5", "it": feed["schedule"][0]["it"]}]

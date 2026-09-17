@@ -29,6 +29,7 @@ import time
 from aiohttp import web
 
 from petkit_local.http.handlers._common import request_device
+from petkit_local.utils.coerce import to_int
 
 #: What the cloud returns for ``nextTick`` when ``latest`` is empty — the
 #: constant 86340 (23h59m) in every such capture, never a computed value.
@@ -44,9 +45,16 @@ _ITEM_JSON = dict(separators=(",", ":"), sort_keys=True)
 #: api-ru.petkit.cn D4H capture 2026-09-16: {"id":"n_55140","t":55140,"a":20},
 #: same `a` in latest[]. `a` is portions x10 (a=10 -> 1 portion; the device
 #: divides by its own constant, as the manual feed path does with `amount`).
-#: Storage stays in `a1` (portions); the translation happens only on the wire.
+#: Live-confirmed on the hardware: a=10 dispensed one portion (~10 g).
+#: Storage stays in `a1` (portions); the translation happens only on the wire,
+#: and `render_feed` below is the ONE place it happens — every emitter of a
+#: feed schedule (HTTP `dev_feed_get`, the MQTT `data_get` answer, and both
+#: `property.set{feed}` pushes) goes through it, so the shapes cannot drift.
 _SINGLE_HOPPER_FEEDERS = {"d4h"}
 _D4H_AMOUNT_PER_PORTION = 10
+#: The firmware keeps feed amounts in a single byte (`sb`, see
+#: `ha/commands.py::_feed`); anything above wraps on the device.
+_AMOUNT_BYTE_MAX = 255
 
 
 def _local_midnight(now: float, day_offset: int) -> float:
@@ -112,10 +120,14 @@ def _build_latest(feed: dict, now: float) -> list[dict]:
         pk_wd = (time.localtime(day_start + 43200).tm_wday + 2) % 7 or 7
         date_str = time.strftime("%Y%m%d", time.localtime(day_start + 43200))
         for group in feed.get("schedule") or []:
+            if not isinstance(group, dict):
+                continue
             days = str(group.get("re", "")).split(",")
             if str(pk_wd) not in (d.strip() for d in days):
                 continue
             for item in group.get("it") or []:
+                if not isinstance(item, dict):
+                    continue
                 t_secs = item.get("t", 0)
                 fire = day_start + t_secs
                 if not now < fire < cutoff:
@@ -130,6 +142,8 @@ def _build_latest(feed: dict, now: float) -> list[dict]:
     deferred = feed.get("deferred") or []
     remaining = []
     for d in deferred:
+        if not isinstance(d, dict):
+            continue
         fire_at = d.get("fire_at", 0)
         if fire_at <= now:
             continue
@@ -157,6 +171,85 @@ def _compute_next_tick(latest: list[dict]) -> int:
     return max(entry["t"] for entry in latest)
 
 
+def is_single_hopper(device) -> bool:
+    """Whether this feeder takes the D4H single-``a`` meal shape on the wire."""
+    return (getattr(device, "device_type", "") or "").lower() in _SINGLE_HOPPER_FEEDERS
+
+
+def _single_hopper_amount(item: dict) -> int:
+    """The scalar ``a`` for one D4H meal, from whatever shape is stored.
+
+    Storage normally holds ``a1`` in portions (the panel and cleaner write
+    that), so ``a`` is ``a1 x 10``. A stored item may instead already carry
+    ``a`` — the device's own shape, which `mqtt/bridge.py` stores verbatim from
+    a property post — and that is passed through unscaled rather than read as
+    zero: a zero here means a meal that runs and dispenses nothing. Coerced
+    with `to_int` so a string or junk value degrades to 0 instead of a 500 on
+    the device's poll, and clamped to the byte the firmware stores it in.
+    """
+    a1 = to_int(item.get("a1"), None)
+    if a1 is not None:
+        amount = a1 * _D4H_AMOUNT_PER_PORTION
+    else:
+        amount = to_int(item.get("a"), 0)
+    return max(0, min(_AMOUNT_BYTE_MAX, amount))
+
+
+def _single_hopper_item(item: dict) -> dict:
+    return {"id": item.get("id"), "t": item.get("t"),
+            "a": _single_hopper_amount(item)}
+
+
+def render_feed(device, feed: dict, now: float, *, item_json: bool = True) -> dict:
+    """The ``{schedule, nextTick, latest}`` body every feed-schedule emitter sends.
+
+    Four call sites send this and MUST agree, because the device reads them
+    interchangeably: `handle_feed_get` (HTTP ``dev_feed_get``), the MQTT
+    ``data_get`` answer for the same name (`mqtt/bridge.py`), and the two
+    ``property.set{feed}`` pushes (`web/api/schedules.py`, `ha/commands.py`).
+
+    ``item_json`` selects the group shape: True is the GET answer, where each
+    group carries the cloud's ``itemJsonString`` twin; False is the push, which
+    the cloud was captured sending as bare ``{re, it}`` groups.
+
+    Non-D4H feeders get exactly what upstream sent — the stored groups verbatim
+    (``itemJsonString`` refreshed in place, as before) or ``{re, it}`` copies —
+    so their bytes do not change. A D4H gets each meal rewritten to the
+    single-``a`` shape, in ``it``, ``itemJsonString`` and ``latest`` alike.
+    """
+    latest = _build_latest(feed, now)
+    next_tick = _compute_next_tick(latest)
+
+    if not is_single_hopper(device):
+        if item_json:
+            for group in feed.get("schedule", []):
+                if isinstance(group, dict) and "it" in group:
+                    group["itemJsonString"] = json.dumps(group["it"], **_ITEM_JSON)
+            schedule = feed.get("schedule", [_EMPTY_GROUP])
+        else:
+            schedule = [{"re": g.get("re", ""), "it": g.get("it", [])}
+                        for g in feed.get("schedule", []) if isinstance(g, dict)]
+        return {"schedule": schedule, "nextTick": next_tick, "latest": latest}
+
+    schedule = []
+    for group in feed.get("schedule", []) or []:
+        if not isinstance(group, dict):
+            continue
+        items = [_single_hopper_item(it) for it in group.get("it") or []
+                 if isinstance(it, dict)]
+        out = {"re": group.get("re", ""), "it": items}
+        if item_json:
+            out["itemJsonString"] = json.dumps(items, **_ITEM_JSON)
+        schedule.append(out)
+    if not schedule and item_json:
+        schedule = [_EMPTY_GROUP]
+    return {
+        "schedule": schedule,
+        "nextTick": next_tick,
+        "latest": [_single_hopper_item(entry) for entry in latest],
+    }
+
+
 async def handle_feed_get(request: web.Request) -> web.Response:
     """Return the device's stored feeding schedule with live countdowns.
 
@@ -165,9 +258,9 @@ async def handle_feed_get(request: web.Request) -> web.Response:
         Structure matches the real cloud's response 1:1.
 
     LOCAL PATCH: a single-hopper D4H is served a single ``a`` per meal instead
-    of the D4SH ``a1``/``a2`` pair (see ``_SINGLE_HOPPER_FEEDERS``). Everything
-    else — grouping, ids, ``t``, ``itemJsonString`` key order, ``latest`` and
-    ``nextTick`` — is unchanged. Non-D4H devices take the original path verbatim.
+    of the D4SH ``a1``/``a2`` pair — see `render_feed`, which is also what the
+    three other feed-schedule emitters send. Non-D4H devices take the original
+    path verbatim.
     """
     device = request_device(request)
 
@@ -187,42 +280,4 @@ async def handle_feed_get(request: web.Request) -> web.Response:
     if migrate_minute_schedule(feed):
         request.app["registry"].save()
 
-    now = time.time()
-    latest = _build_latest(feed, now)
-    next_tick = _compute_next_tick(latest)
-
-    if (getattr(device, "device_type", "") or "").lower() not in _SINGLE_HOPPER_FEEDERS:
-        for group in feed.get("schedule", []):
-            if "it" in group:
-                group["itemJsonString"] = json.dumps(group["it"], **_ITEM_JSON)
-        return web.json_response({
-            "result": {
-                "schedule": feed.get("schedule", [_EMPTY_GROUP]),
-                "nextTick": next_tick,
-                "latest": latest,
-            }
-        })
-
-    # Single-hopper D4H: emit `a` (= a1 portions x _D4H_AMOUNT_PER_PORTION).
-    def _wire(item: dict) -> dict:
-        return {"id": item.get("id"), "t": item.get("t"),
-                "a": int(item.get("a1") or 0) * _D4H_AMOUNT_PER_PORTION}
-
-    schedule_out = []
-    for group in feed.get("schedule", []) or []:
-        items = [_wire(it) for it in group.get("it") or []]
-        schedule_out.append({
-            "re": group.get("re", ""),
-            "it": items,
-            "itemJsonString": json.dumps(items, **_ITEM_JSON),
-        })
-    if not schedule_out:
-        schedule_out = [_EMPTY_GROUP]
-
-    return web.json_response({
-        "result": {
-            "schedule": schedule_out,
-            "nextTick": next_tick,
-            "latest": [_wire(entry) for entry in latest],
-        }
-    })
+    return web.json_response({"result": render_feed(device, feed, time.time())})
