@@ -129,15 +129,11 @@ jobs:
             primary="$version"
             tags="-t ${image}:${version} -t ${image}:latest"
           else
-            # Just the one moving tag. A per-commit tag would be a second name
-            # for something the digest already identifies permanently, and it
-            # would leave a tagged version behind on every push -- which GitHub
-            # then shows as the package's headline, offering a `docker pull` of
-            # an unreleased build to anyone who lands on the page.
-            # `org.opencontainers.image.revision` on the image itself is what
-            # maps a build back to its commit.
-            primary="dev"
-            tags="-t ${image}:dev"
+            # homelab deploys pin an immutable per-commit tag, so a main build
+            # is addressable forever and a terragrunt/Helm pin never drifts
+            # under it. Old sha- tags are swept by prune-packages.yml.
+            primary="sha-$(echo "$GITHUB_SHA" | cut -c1-7)"
+            tags="-t ${image}:${primary}"
           fi
 
           sources=""
