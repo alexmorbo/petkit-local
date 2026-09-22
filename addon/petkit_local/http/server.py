@@ -50,6 +50,7 @@ from petkit_local.http.handlers.upload_log import (
 from petkit_local.http.handlers.stubs import (
     handle_sync_time,
     handle_ota_check,
+    handle_package_auth,
     handle_oss_sts,
     handle_video_device_info,
     handle_device_info,
@@ -109,6 +110,7 @@ def create_app(registry: DeviceRegistry, config: dict) -> web.Application:
         app.router.add_route("*", f"{p}/dev_syncTime", handle_sync_time)
         app.router.add_route("*", f"{p}/dev_ota_check", handle_ota_check)
         app.router.add_route("*", f"{p}/dev_ota_heartbeat", handle_ota_check)
+        app.router.add_route("*", f"{p}/dev_package_auth", handle_package_auth)
         app.router.add_route("*", f"{p}/dev_ota_start", handle_event_report)
         app.router.add_route("*", f"{p}/dev_ota_complete", handle_event_report)
         app.router.add_route("*", f"{p}/dev_oss_sts_info_new", handle_oss_sts)

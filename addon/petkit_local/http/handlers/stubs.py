@@ -254,3 +254,23 @@ async def handle_sound_get(request: web.Request) -> web.Response:
         if sounds:
             return web.json_response({"result": sounds})
     return web.json_response({"result": []})
+
+
+async def handle_package_auth(request: web.Request) -> web.Response:
+    """``dev_package_auth?sn=<ring serial>&secret=<ring secret>`` — authorize a
+    refill-ring / consumable package.
+
+    A camera litter box (T6 Purobot Ultra) reads the sn and secret off the
+    refill ring's NFC tag and asks the cloud to vouch for them; the real cloud
+    answers ``{"result":{"packageInstallTime":<unix>,"count":<used cycles>}}``,
+    and an empty ``{}`` leaves the box stuck on "refill ring is not usable"
+    (captured on a T6 2026-09-22, sn+secret both supplied by the device). We
+    accept it, as we accept every other consumable: the credentials came off the
+    physical ring already, and a local server has no counterfeit database to
+    weigh them against. ``count`` is the ring's used-cycle count — 0 for a fresh
+    ring; the box tracks its own consumption from there via package_over /
+    melt_over events.
+    """
+    return web.json_response(
+        {"result": {"packageInstallTime": int(time.time()), "count": 0}}
+    )
