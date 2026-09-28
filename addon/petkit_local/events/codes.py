@@ -1084,6 +1084,12 @@ FEED_SRC: dict[int, str] = {
 #: Grading per value:
 #:   0  confirmed — normal completion, amounts > 0
 #:   3  inferred — co-occurs with err_code=4 and zero amounts (capture 2026-08-11)
+#:   6  inferred — D4H 867 only, not traced in disassembly. The first feed after
+#:      the hopper was emptied by hand came back `real_amount: 0`, `err_code: 0`,
+#:      and `food` fell 2 -> 0 seven seconds later; PetKit's own cloud, fed the
+#:      same event through proxy mode, pushed "food container stock
+#:      insufficient" for it. Reads as the D4H's counterpart of the D4SH's 9 —
+#:      same meaning, different number — but no D4SH has been seen sending 6.
 #:   7  inferred — co-occurs with err_code=7 (two captures)
 #:   8  inferred — co-occurs with err_code=8, single observation (issue #2)
 #:   9  inferred — firmware sets real_amount=-1 and skips the motor (disasm
@@ -1094,6 +1100,7 @@ FEED_SRC: dict[int, str] = {
 FEED_RESULT: dict[int, str] = {
     0: "completed",
     3: "blocked (outlet obstructed)",
+    6: "skipped (hopper empty)",
     7: "failed (error 7)",
     8: "failed (nothing dispensed)",
     9: "skipped (hoppers empty)",

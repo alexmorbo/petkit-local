@@ -212,3 +212,28 @@ def test_litter_weight_is_published_in_the_unit_the_device_reports():
     # between the two is the tell that one of them is wrong.
     _, pet = next((e, p) for e, p in _build_all(d) if e.key == "pet_weight")
     assert pet["unit_of_measurement"] == p["unit_of_measurement"]
+
+
+def test_d4h_food_low_is_on_when_the_hopper_is_empty_not_when_it_is_full():
+    """The D4H's `food` is a 0/2 level -- 2 has food, 0 is empty -- verified on
+    a real 867. The family `food_low` read it for truthiness, so it sat ON for
+    as long as the hopper was full and would have gone OFF once it ran out."""
+    d = Device(device_type="d4h", petkit_id=1, serial_number="SN")
+    lows = [(e, p) for e, p in _build_all(d) if e.key == "food_low"]
+    assert len(lows) == 1, "the D4H override must replace the family entity, not add one"
+    _, p = lows[0]
+
+    assert _render(p["value_template"], {"state": {"food": 0}}) == "ON"
+    assert _render(p["value_template"], {"state": {"food": 2}}) == "OFF"
+    # Not yet reported must not read as empty. `false == 0` in Jinja, so a
+    # `default(false)` here would have turned a missing field into ON.
+    assert _render(p["value_template"], {"state": {}}) == "OFF"
+
+
+def test_food_low_on_the_other_feeders_still_reads_truthiness():
+    """`on_values` is opt-in: a model that does not set it keeps the old
+    "any truthy value is ON" template byte for byte."""
+    d = Device(device_type="d4", petkit_id=1, serial_number="SN")
+    _, p = next((e, p) for e, p in _build_all(d) if e.key == "food_low")
+    assert _render(p["value_template"], {"state": {"food": 1}}) == "ON"
+    assert _render(p["value_template"], {"state": {"food": 0}}) == "OFF"

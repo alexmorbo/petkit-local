@@ -248,9 +248,9 @@ FEEDER_BINARY_SENSORS = [
 #: They must be a separate list, not shared-and-excluded: `model_excludes` filters
 #: only the family base, NOT `model_entities`, so excluding `hopper2_level` for a
 #: D4H (as the code used to) never actually removed it. A single-hopper feeder
-#: must simply not be GIVEN these — see `ha/categories.py`. A D4H is ASSUMED to
-#: report the singular `food` instead (shown by the family `food_low`); that is
-#: inference from the cloud model, unverified until a D4H is captured.
+#: must simply not be GIVEN these — see `ha/categories.py`. A D4H reports the
+#: singular `food` instead — verified on real hardware, see
+#: FEEDER_SINGLE_HOPPER_SENSORS.
 #:
 #: 2 = has food and 0 = empty, reported by the D4SH owner, who never saw 1 in
 #: between. So this is not a percentage, and it is not a two-state either until
@@ -270,13 +270,45 @@ FEEDER_DUAL_HOPPER_SENSORS = [
 #: the dual `hopper1_level` with the "1" dropped and pointed at the singular
 #: `state.food` the rest of the feeder family uses.
 #:
-#: GUESSED: no D4H has ever reported here, so whether it sends `food` (like the
-#: single-hopper cloud model) or `food1` (like the D4SH it shares a `ctrl` with)
-#: is unverified. This bets on `food`. Same 0/2 enum as the dual sensors above.
+#: VERIFIED on a real D4H (firmware 867): it sends the singular `food`, never
+#: `food1`/`food2`, and only ever 0 or 2.
+#:
+#: `food` is NOT a live level. The D4H has no hopper sensor that watches the
+#: food go down: it learns the hopper is empty only when a feed puts out
+#: nothing, and learns it is full again only when a feed succeeds. Watched end to
+#: end: thirty 10 g feeds ran with `food: 2` until the last kibble went, the
+#: next feed came back `result: 6, real_amount: 0` and `food` fell to 0 seven
+#: seconds later; after a refill, the first successful feed put it back to 2.
+#: So it lags reality by one feed in both directions, and there is no way to
+#: read it sooner.
 FEEDER_SINGLE_HOPPER_SENSORS = [
     EntityDef(component="sensor", key="hopper_level", name="Hopper",
               value_path="state.food", icon="mdi:silo",
               options=["Empty", "Has food"], option_values=[0, 2]),
+]
+
+#: The D4H's own "Food Low", replacing the family one it inherited.
+#:
+#: The family `food_low` reads `state.food` for TRUTHINESS, which is right for a
+#: model whose `food` is a shortage flag and exactly backwards here: the D4H
+#: reports 2 when it has food and 0 when it is empty, so the inherited entity
+#: sat ON for as long as the hopper was full and would have gone OFF only once
+#: it ran out. The owner's history showed it: OFF while the hopper read Empty,
+#: ON from the moment it was filled.
+#:
+#: Same key, so it is the same entity in HA with the same unique_id, and the
+#: fix lands on the sensor people already have instead of leaving a second one
+#: behind.
+#:
+#: ON for 0 alone. A 1 has never been reported by the device; the only 1 seen
+#: is what `food_replenished` WRITES, meaning "has food" — which the D4H ignores
+#: (no set_reply, no change), so that button does not work on this model.
+#:
+#: Like `hopper_level` it lags by one feed: see above.
+FEEDER_D4H_BINARY_SENSORS = [
+    EntityDef(component="binary_sensor", key="food_low", name="Food Low",
+              value_path="state.food", device_class="problem",
+              icon="mdi:food-drumstick-off", on_values=(0,)),
 ]
 
 FEEDER_NEXT_GEN_SENSORS = [

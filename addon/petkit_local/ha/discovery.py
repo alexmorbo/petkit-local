@@ -70,6 +70,11 @@ class EntityDef:
             unbounded.
         payload_on, payload_off: `switch` payloads, used for BOTH the command
             payload and the state HA matches against.
+        on_values: the raw device values that mean ON, for a `binary_sensor`
+            whose field is a level or an outcome code rather than a 0/1 flag.
+            Empty keeps the default, "any truthy value is ON". The D4H's `food`
+            is why this exists: 2 means food and 0 means empty, so reading it
+            for truthiness shows the hopper upside down.
     """
 
     component: str
@@ -91,6 +96,7 @@ class EntityDef:
     step: float = 1
     payload_on: str = "ON"
     payload_off: str = "OFF"
+    on_values: tuple = ()
 
     @property
     def unique_id_suffix(self) -> str:
@@ -288,6 +294,12 @@ def _value_template(entity: EntityDef) -> str:
     # no attribute ..." for every publish. Defaulting keeps the rendered value
     # identical while silencing the noise.
     if entity.component in ("binary_sensor", "switch"):
+        if entity.on_values:
+            # `default(none)`, not `default(false)`: an unreported field must
+            # match nothing, and `false == 0` in Jinja would read it as ON.
+            matched = ", ".join(repr(v) for v in entity.on_values)
+            return ("{{ 'ON' if (" + accessor + " | default(none)) in ["
+                    + matched + "] else 'OFF' }}")
         return "{{ 'ON' if " + accessor + " | default(false) else 'OFF' }}"
     if entity.component == "select":
         return _select_value_template(entity, accessor)

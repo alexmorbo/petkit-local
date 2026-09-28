@@ -41,7 +41,8 @@ from petkit_local.ha.entities.selects import (
     FEEDER_SELECTS, FOUNTAIN_SELECTS, FOUNTAIN_W7H_SELECTS, LITTER_SELECTS,
 )
 from petkit_local.ha.entities.sensors import (
-    FEEDER_BINARY_SENSORS, FEEDER_DUAL_HOPPER_SENSORS, FEEDER_NEXT_GEN_HALL_SENSORS,
+    FEEDER_BINARY_SENSORS, FEEDER_D4H_BINARY_SENSORS, FEEDER_DUAL_HOPPER_SENSORS,
+    FEEDER_NEXT_GEN_HALL_SENSORS,
     FEEDER_NEXT_GEN_SENSORS, FEEDER_SINGLE_HOPPER_SENSORS, FEEDER_SENSORS,
     FOUNTAIN_BINARY_SENSORS, FOUNTAIN_SENSORS,
     FOUNTAIN_W7H_BINARY_SENSORS, FOUNTAIN_W7H_HALL_SENSORS, FOUNTAIN_W7H_SENSORS,
@@ -135,7 +136,19 @@ class CategorySpec:
             entities.extend(e for e in self.camera_entities if e.key not in excluded)
         for model, extra in self.model_entities:
             if model == codename:
-                entities.extend(extra)
+                for entity in extra:
+                    # A model entity sharing a key with a family one OVERRIDES it
+                    # where it stands, rather than excluding it and appending a
+                    # copy: same key means the same HA entity, and moving it to
+                    # the end would reorder what a camera model shares with its
+                    # plain twin for no reason (test_camera_bundle_is_appended_
+                    # to_the_shared_base). The D4H's `food_low` is the case.
+                    at = next((i for i, e in enumerate(entities)
+                               if e.key == entity.key), None)
+                    if at is None:
+                        entities.append(entity)
+                    else:
+                        entities[at] = entity
         return entities
 
     def state_topics_for(self, has_camera: bool, device_type: str = "") -> list[str]:
@@ -232,10 +245,11 @@ CATEGORY_SPECS: dict[str, CategorySpec] = {
             # single FEEDER_SINGLE_HOPPER_SENSORS (`hopper_level` -> `state.food`),
             # a D4SH the dual FEEDER_DUAL_HOPPER_SENSORS (`hopper1/2_level` ->
             # `food1`/`food2`), like the dual buttons/numbers beside it. The D4H
-            # side is GUESSED — no D4H has been captured; it bets on singular
-            # `food`, not the D4SH's `food1`. See FEEDER_SINGLE_HOPPER_SENSORS.
+            # side is verified on real hardware: singular `food`, 0 or 2. It also
+            # gets its own `food_low` (FEEDER_D4H_BINARY_SENSORS), because the
+            # family one reads that 0/2 level upside down.
             ("d4h", (*FEEDER_NEXT_GEN_SENSORS, *FEEDER_SINGLE_HOPPER_SENSORS,
-                     *FEEDER_NEXT_GEN_HALL_SENSORS)),
+                     *FEEDER_NEXT_GEN_HALL_SENSORS, *FEEDER_D4H_BINARY_SENSORS)),
             ("d4sh", (*FEEDER_NEXT_GEN_SENSORS, *FEEDER_DUAL_HOPPER_SENSORS,
                       *FEEDER_NEXT_GEN_HALL_SENSORS,
                       *FEEDER_DUAL_BUTTONS, *FEEDER_DUAL_NUMBERS)),
@@ -255,19 +269,19 @@ CATEGORY_SPECS: dict[str, CategorySpec] = {
             ("d4sh", frozenset({
                 "food_low", "food_in_bowl", "food_bowl_pct", "battery_installed",
             })),
-            # GUESSED — no real D4H has ever reported to this add-on; the whole
-            # feeder mapping is extrapolated from the D4SH, which shares its
-            # `ctrl`. We model the D4H as a plain SINGLE-hopper feeder: it is
-            # ASSUMED to report the family's singular `food`, not the D4SH's
-            # `food1`/`food2`. So both entities that read `state.food` are KEPT —
-            # `food_low` (dropped in the D4SH row above) and the singular
-            # `hopper_level` from FEEDER_SINGLE_HOPPER_SENSORS in the row above —
-            # while the dual `hopper1/2_level` are simply never given to the D4H.
-            # This is inference, not evidence: if a captured D4H turns out to
-            # report `food1` like the D4SH, put `food_low` back in this set and
-            # swap FEEDER_SINGLE_HOPPER_SENSORS for FEEDER_DUAL_HOPPER_SENSORS in
-            # the `d4h` model_entities row. cf. DEVICE_TYPES_FEEDER_DUAL — the
-            # firmware-verified half of the split.
+            # VERIFIED on a real D4H (firmware 867), which is a plain
+            # SINGLE-hopper feeder reporting the family's singular `food`, never
+            # the D4SH's `food1`/`food2`. So the singular `hopper_level` from
+            # FEEDER_SINGLE_HOPPER_SENSORS is right, and the dual
+            # `hopper1/2_level` are never given to it.
+            #
+            # `food_low` is NOT excluded here, it is overridden: the family one
+            # reads `food` for truthiness, and the D4H's `food` is a 0/2 level —
+            # 2 has food, 0 is empty — so the inherited entity was ON exactly
+            # while the hopper was full. FEEDER_D4H_BINARY_SENSORS carries the
+            # same key, and `entities_for` puts a same-key model entity in the
+            # family one's place, so HA updates the existing entity instead of
+            # being left with a stale one.
             ("d4h", frozenset({
                 "food_in_bowl", "food_bowl_pct", "battery_installed",
             })),
