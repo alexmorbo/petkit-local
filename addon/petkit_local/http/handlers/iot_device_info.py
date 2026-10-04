@@ -55,6 +55,35 @@ def self_mqtt_host(config: dict) -> str:
     return urlparse(config.get("api_url", "")).hostname or ""
 
 
+def mqtt_host_for(device: Device, config: dict) -> str:
+    """The `mqttHost` to hand `device`: our broker, unless opted out for ESP32.
+
+    With the `esp32_aliyun_mqtt_host` option on, an ESP32 model (anything not
+    `is_next_gen`) is handed `Device.aliyun_mqtt_host`,
+    `<productKey>.iot-as-mqtt.eu-central-1.aliyuncs.com`, instead of the host
+    `self_mqtt_host` derives from `api_url`. Off by default, and the Linux
+    models never see it: they connect with the derived host, and the `cacert`
+    patcher pins their trust to it.
+
+    Why it exists: a T4 handed the API host completes the TLS handshake to the
+    broker, then never gets a session up and gives up after ~10 s, while the
+    same device handed a name under `iot-as-mqtt.eu-central-1.aliyuncs.com`
+    connects at once (issue #34; independently, a D4S in another fork). The
+    option is useful only with two things this add-on does not do for you:
+    DNS that resolves that name to this host, and a broker certificate whose
+    DNS SAN covers it (`*.iot-as-mqtt.eu-central-1.aliyuncs.com`) from a CA the
+    device trusts. A stock ESP32 that pins PetKit's CA will refuse the
+    certificate either way.
+
+    Proxy mode does not consult this: its redaction rewrites the cloud's
+    `mqttHost` to `self_mqtt_host` (`http/redact/rules.py`), so a proxied
+    device is handed this server's address as before.
+    """
+    if config.get("esp32_aliyun_mqtt_host") and not device.is_next_gen:
+        return device.aliyun_mqtt_host
+    return device.resolve_mqtt_host(self_mqtt_host(config))
+
+
 def _resolve_or_create_device(request: web.Request) -> Device | None:
     """Return the requesting device, registering it if it is unknown.
 
@@ -98,7 +127,7 @@ async def handle_iot_device_info(request: web.Request) -> web.Response:
     device = _resolve_or_create_device(request)
     if not device:
         return no_device_response()
-    mqtt_host = device.resolve_mqtt_host(self_mqtt_host(request.app["config"]))
+    mqtt_host = mqtt_host_for(device, request.app["config"])
     flat = device.device_type in FLAT_CREDENTIAL_TYPES
     log.info("IoT device info%s: id=%d -> pk=%s dn=%s mqttHost=%s",
              " (flat)" if flat else "", device.petkit_id, device.mqtt_product_key,
@@ -118,7 +147,7 @@ async def handle_iot_device_info_flat(request: web.Request) -> web.Response:
     device = _resolve_or_create_device(request)
     if not device:
         return no_device_response()
-    mqtt_host = device.resolve_mqtt_host(self_mqtt_host(request.app["config"]))
+    mqtt_host = mqtt_host_for(device, request.app["config"])
     log.info("IoT device info (flat): id=%d -> pk=%s dn=%s mqttHost=%s",
              device.petkit_id, device.mqtt_product_key, device.mqtt_device_name, mqtt_host)
     return web.json_response(payloads.to_iot_device_info_flat(device, mqtt_host))

@@ -465,6 +465,36 @@ async def test_esp32_litter_boxes_get_the_flat_credential_block():
         await client.close()
 
 
+async def test_esp32_aliyun_mqtt_host_is_opt_in_and_esp32_only():
+    """With the option on, an ESP32 model is handed its Aliyun broker name
+    (issue #34); a Linux model keeps our host, and with it off nothing changes."""
+    reg = DeviceRegistry()
+    client = await _client(reg, {**CONFIG, "esp32_aliyun_mqtt_host": True})
+    try:
+        await client.post("/6/t4/dev_signup", headers=HDR)
+        r = await client.post("/6/t4/dev_iot_device_info", headers=HDR)
+        res = (await r.json())["result"]
+        t4 = reg.get(100)
+        assert res["mqttHost"] == t4.aliyun_mqtt_host
+        assert res["mqttHost"].endswith(".iot-as-mqtt.eu-central-1.aliyuncs.com")
+
+        hdr = {"X-Device": "id=105&sn=SNt5"}
+        await client.post("/6/t5/dev_signup", headers=hdr)
+        r = await client.post("/6/t5/dev_only_iot_device_info_v2", headers=hdr)
+        assert (await r.json())["result"]["ali"]["mqttHost"] == "server"
+    finally:
+        await client.close()
+
+    reg = DeviceRegistry()
+    client = await _client(reg)
+    try:
+        await client.post("/6/t4/dev_signup", headers=HDR)
+        r = await client.post("/6/t4/dev_iot_device_info", headers=HDR)
+        assert (await r.json())["result"]["mqttHost"] == "server"
+    finally:
+        await client.close()
+
+
 async def test_mqtt_host_is_always_our_broker():
     # No global mqtt_host setting and no HTTP-only fallback: every device is
     # handed our own broker host (derived from api_url), every time.

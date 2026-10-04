@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **New option `esp32_aliyun_mqtt_host`** (off by default) hands ESP32
+  devices their Aliyun broker name,
+  `<productKey>.iot-as-mqtt.eu-central-1.aliyuncs.com`, as `mqttHost` instead
+  of the API host. A T4 told to reach the broker under the API host completes
+  the TLS handshake and then never gets a session up; the same device handed a
+  name under that Aliyun domain connects at once (issue #34). It only helps
+  with DNS that resolves the name to this host and a broker certificate that
+  covers it and that the device trusts, neither of which the add-on sets up. The
+  Linux models never get it, and proxy mode keeps handing out this server's
+  address.
+
 - **The ESP32 litter boxes (T3, T4) get their MQTT credentials flat.** Every
   model was answered with the `ali`-wrapped block on all three
   `iot_device_info` endpoints. PetKit's cloud answers a T3 (fw 1.491) flat, no
