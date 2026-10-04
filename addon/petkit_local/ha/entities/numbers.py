@@ -94,7 +94,8 @@ FOUNTAIN_NUMBERS = [
 #: the app offers, and the device does its own clamping. It exists to stop an
 #: obviously-wrong value from reaching hardware, not because 30 was measured.
 #:
-#: The matching times are `time` entities, not numbers — see `times.py`.
+#: The matching times are `time` entities, not numbers — see `times.py`. The
+#: app capture of 2026-10-04 confirms the encoding (`waterChangeCycle` 4).
 FOUNTAIN_W7H_NUMBERS = [
     EntityDef(component="number", key="water_change_cycle", name="Drain & Refill Cycle",
               value_path="settings.waterChangeCycle", icon="mdi:water-refresh",
@@ -102,12 +103,24 @@ FOUNTAIN_W7H_NUMBERS = [
     EntityDef(component="number", key="flush_cycle", name="Drain & Flush Cycle",
               value_path="settings.flushCycle", icon="mdi:water-sync",
               unit="d", min_value=1, max_value=30, step=1),
-    # Same field and the same unverified 0-9 as LITTER_CAMERA_NUMBERS above,
-    # and for a weaker reason still: the W7H map observed exactly one value (1)
-    # and says outright that the range was not established. Shipped anyway
-    # because a volume control nobody can reach is worse than a wide one, and
-    # the device clamps.
+    # 1-9, the official app's slider (captured at 1, 9 and 2 on 2026-10-04,
+    # `codes.FOUNTAIN_W7H_APP_SET_FIELDS`). It was 0-9 here, one step wider than
+    # anything the app can send; the litter and feeder lists keep their own
+    # bound, since this capture says nothing about them.
     EntityDef(component="number", key="volume", name="Volume",
               value_path="settings.volume", icon="mdi:volume-high",
-              min_value=0, max_value=9, step=1),
+              min_value=1, max_value=9, step=1),
+    # MINUTES, 1-60, and they override the family's `fountain_time` and
+    # `sleep_time` in place (same keys, so the same HA entities). The family
+    # list says hours 1-24, a cloud-model guess for the Bluetooth fountains; the
+    # official app's pickers for a W7H run 1-60 min and it was captured writing
+    # 15, 28 and 60 (`codes.FOUNTAIN_W7H_APP_SET_FIELDS`). Both only matter in
+    # the intermittent flow mode: how long the water runs, then how long it
+    # rests.
+    EntityDef(component="number", key="fountain_time", name="Fountain Time",
+              value_path="settings.fountainTime", icon="mdi:clock-outline",
+              unit="min", min_value=1, max_value=60, step=1),
+    EntityDef(component="number", key="sleep_time", name="Sleep Time",
+              value_path="settings.sleepTime", icon="mdi:sleep",
+              unit="min", min_value=1, max_value=60, step=1),
 ]
