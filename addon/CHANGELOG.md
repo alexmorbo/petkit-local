@@ -21,6 +21,9 @@
   relabelled "Drain & Flush", the app's name for it. Refill (`2`) is now
   confirmed rather than inferred.
 
+- **W7H Drain & Refill Cycle and Drain & Flush Cycle run 1-7 days**, the
+  official app's range for both pickers (fw 456). They were 1-30.
+
 - **Fountain Time and Sleep Time are minutes, 1-60.** They were hours, 1-24. The
   app's pickers run 1-60 minutes and it was captured writing 15, 28 and 60.
   **Volume** now runs 1-9, the app's slider, instead of 0-9.

@@ -802,3 +802,10 @@ def test_a_zero_volume_is_dropped_with_the_old_seed():
     assert defaults.retire_stale_seed(device) == ["volume"]
     assert device.config["settings"] == {}
 
+
+def test_the_cycle_numbers_run_one_to_seven_days_like_the_app():
+    """Both of the app's cycle pickers offer 1-7 days (W7H fw 456, 2026-10-04)."""
+    device = Device(device_type="w7h", petkit_id=1, serial_number="W")
+    numbers = {e.key: e for e in get_entities_for_device(device) if e.component == "number"}
+    for key in ("water_change_cycle", "flush_cycle"):
+        assert (numbers[key].min_value, numbers[key].max_value, numbers[key].unit) == (1, 7, "d")

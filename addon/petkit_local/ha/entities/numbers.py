@@ -90,19 +90,20 @@ FOUNTAIN_NUMBERS = [
 #: capture-derived map supplied 2026-08-09 does — "N = every N days", with 1 and
 #: 7 both observed — which is the encoding, not the bound.
 #:
-#: 1..30 is therefore a SOFT ceiling: a month is well past any cleaning interval
-#: the app offers, and the device does its own clamping. It exists to stop an
-#: obviously-wrong value from reaching hardware, not because 30 was measured.
+#: 1..7 is the official app's own range: both pickers ("Drain & Refill" and
+#: "Drain & Flush") offer 1-7 days, read off the app driving a W7H on fw 456
+#: (2026-10-04). It was 1..30 here, a soft ceiling guessed before anybody had
+#: looked, which let HA send values the app can never produce.
 #:
 #: The matching times are `time` entities, not numbers — see `times.py`. The
 #: app capture of 2026-10-04 confirms the encoding (`waterChangeCycle` 4).
 FOUNTAIN_W7H_NUMBERS = [
     EntityDef(component="number", key="water_change_cycle", name="Drain & Refill Cycle",
               value_path="settings.waterChangeCycle", icon="mdi:water-refresh",
-              unit="d", min_value=1, max_value=30, step=1),
+              unit="d", min_value=1, max_value=7, step=1),
     EntityDef(component="number", key="flush_cycle", name="Drain & Flush Cycle",
               value_path="settings.flushCycle", icon="mdi:water-sync",
-              unit="d", min_value=1, max_value=30, step=1),
+              unit="d", min_value=1, max_value=7, step=1),
     # 1-9, the official app's slider (captured at 1, 9 and 2 on 2026-10-04,
     # `codes.FOUNTAIN_W7H_APP_SET_FIELDS`). It was 0-9 here, one step wider than
     # anything the app can send; the litter and feeder lists keep their own
