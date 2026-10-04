@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **The ESP32 litter boxes (T3, T4) get their MQTT credentials flat.** Every
+  model was answered with the `ali`-wrapped block on all three
+  `iot_device_info` endpoints. PetKit's cloud answers a T3 (fw 1.491) flat, no
+  `ali` key (proxied capture, issue #35), and a stock T4 (fw 1.652) handed the
+  wrapped block kept re-running signup and `dev_iot_device_info` instead of
+  settling (#33); answered flat, it settles. Only `t3` and `t4` change: the
+  ESP32 feeders and everything else keep the wrapped block a D4SH capture
+  showed, since nothing says otherwise for them.
+
 ## 2.1.0 — 2026-08-12
 
 The YumShare Dual-Hopper (D4SH) camera feeder is now confirmed working, and most

@@ -20,6 +20,19 @@ from petkit_local.http.handlers._common import (
 
 log = logging.getLogger(__name__)
 
+#: The models answered with the FLAT credential block (no `ali` wrapper). Only
+#: the ESP32 litter boxes: PetKit's own cloud answers a T3 (fw 1.491) flat on
+#: `dev_iot_device_info` (proxied capture, issue #35), and a stock T4 (fw 1.652)
+#: handed the wrapped block re-runs signup -> iot_device_info in a loop (the
+#: loop of issue #33) where the flat block lets it settle (live, one T4; a T3
+#: owner reports the same in #35). The one contrary report, a T4 on
+#: LocalKit-patched firmware reading the wrapped block (#34), is not stock
+#: firmware. Deliberately NOT
+#: `not device.is_next_gen`: that complement also holds the ESP32 feeders, the
+#: BLE-only codenames and any model not yet listed, none of which has evidence
+#: either way, so they keep the wrapped block the D4SH capture showed.
+FLAT_CREDENTIAL_TYPES = frozenset({"t3", "t4"})
+
 
 def self_mqtt_host(config: dict) -> str:
     """Return the broker hostname to hand devices — the box they already reach.
@@ -70,30 +83,37 @@ def _resolve_or_create_device(request: web.Request) -> Device | None:
 
 
 async def handle_iot_device_info(request: web.Request) -> web.Response:
-    """`dev_only_iot_device_info[_v2]` (Ingenic) — Aliyun-wrapped credentials.
+    """`dev_iot_device_info` / `dev_only_iot_device_info[_v2]` — MQTT credentials.
+
+    All three endpoint names are routed here (`http/server.py`), so the shape
+    is chosen by model, not by endpoint.
 
     Returns:
-        `payloads.to_iot_device_info()`: the broker host plus the product key,
-        device name and secret the device signs its MQTT CONNECT with (see
-        `mqtt/auth.py`), nested in the Aliyun IoT envelope this firmware family
-        expects. `handle_iot_device_info_flat` returns the same facts unnested.
+        The broker host plus the product key, device name and secret the
+        device signs its MQTT CONNECT with (see `mqtt/auth.py`):
+        `payloads.to_iot_device_info_flat()` for `FLAT_CREDENTIAL_TYPES`,
+        `payloads.to_iot_device_info()` (nested in the Aliyun `ali` envelope)
+        for everything else.
     """
     device = _resolve_or_create_device(request)
     if not device:
         return no_device_response()
     mqtt_host = device.resolve_mqtt_host(self_mqtt_host(request.app["config"]))
-    log.info("IoT device info: id=%d -> pk=%s dn=%s mqttHost=%s",
-             device.petkit_id, device.mqtt_product_key, device.mqtt_device_name, mqtt_host)
-    return web.json_response(payloads.to_iot_device_info(device, mqtt_host))
+    flat = device.device_type in FLAT_CREDENTIAL_TYPES
+    log.info("IoT device info%s: id=%d -> pk=%s dn=%s mqttHost=%s",
+             " (flat)" if flat else "", device.petkit_id, device.mqtt_product_key,
+             device.mqtt_device_name, mqtt_host)
+    body = (payloads.to_iot_device_info_flat(device, mqtt_host) if flat
+            else payloads.to_iot_device_info(device, mqtt_host))
+    return web.json_response(body)
 
 
 async def handle_iot_device_info_flat(request: web.Request) -> web.Response:
-    """`dev_iot_device_info` (ESP32) — the same credentials, un-nested.
+    """The same credentials, always un-nested. Not routed.
 
-    Resolution and credentials are identical to `handle_iot_device_info`; only
-    the response schema differs (`payloads.to_iot_device_info_flat()` — same
-    fields without the `ali` wrapper or its `iotPlatform` marker). Both are
-    routed, because which endpoint a device calls is decided by its firmware.
+    `http/server.py` sends every endpoint name to `handle_iot_device_info`,
+    which picks the flat shape itself for `FLAT_CREDENTIAL_TYPES`; this is
+    kept for callers that want the flat block unconditionally.
     """
     device = _resolve_or_create_device(request)
     if not device:
