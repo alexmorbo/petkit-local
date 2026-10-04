@@ -491,3 +491,24 @@ def test_the_litter_type_seed_is_gone():
     idx = _settable_index(dev)
     _, payload = handle_ha_command(dev, idx["sand_type"], "mixed")
     assert payload["params"] == {"sandType": 3}
+
+
+
+def test_the_feed_id_counts_the_devices_day_not_the_containers(monkeypatch):
+    """A Moscow feeder on a UTC container: at 01:00 Moscow on 2026-10-04 the
+    id is that day's, 3600 s in, not the container's 22:00 on the 3rd."""
+    import time
+
+    from petkit_local.ha.commands import _feed_id
+
+    monkeypatch.setenv("TZ", "UTC")
+    time.tzset()
+    try:
+        d = Device(device_type="d4h", petkit_id=3, serial_number="M")
+        d.config["locale"] = "Europe/Moscow"
+        assert _feed_id(d, now=1791064800.0) == "r_20261004_3600_3600-1"
+        d.config["timezone"] = 5.75  # an override still wins over the locale
+        assert _feed_id(d, now=1791064800.0) == "r_20261004_13500_13500-1"
+    finally:
+        monkeypatch.undo()
+        time.tzset()

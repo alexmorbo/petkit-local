@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import tzinfo
 from typing import Any
 
 from petkit_local.utils.const import (
@@ -25,7 +26,9 @@ from petkit_local.utils.const import (
 )
 from petkit_local.utils.coerce import to_bool, to_float
 from petkit_local.utils.crypto import generate_device_secret, generate_product_key
-from petkit_local.utils.timeutil import local_offset_hours, offset_hours_for_locale
+from petkit_local.utils.timeutil import (
+    fixed_offset_tz, local_offset_hours, offset_hours_for_locale, zone_for_locale,
+)
 
 
 class Refused(ValueError):
@@ -347,6 +350,21 @@ class Device:
         if reported is not None:
             return reported
         return local_offset_hours()
+
+    @property
+    def timezone_info(self) -> tzinfo:
+        """The zone the device keeps its own clock in, for cutting ITS days.
+
+        Same precedence as `timezone_offset`. When the winner is the zone NAME
+        the device reported, that zone itself is returned, so a day computed
+        across a DST change is still cut at the device's real midnight; every
+        other source is a number, and becomes a fixed offset.
+        """
+        if to_float(self.config.get("timezone"), None) is None:
+            zone = zone_for_locale(self.config.get("locale"))
+            if zone is not None:
+                return zone
+        return fixed_offset_tz(self.timezone_offset)
 
     @property
     def aliyun_mqtt_host(self) -> str:

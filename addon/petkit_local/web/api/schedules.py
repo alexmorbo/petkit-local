@@ -312,8 +312,9 @@ async def api_deferred_feed(request: web.Request) -> web.Response:
 
     try:
         dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-        dt = dt.replace(tzinfo=datetime.timezone(
-            datetime.timedelta(hours=d.timezone_offset)))
+        # The device's own zone, so a feed set across a DST change still
+        # fires at the wall-clock time asked for.
+        dt = dt.replace(tzinfo=d.timezone_info)
     except (ValueError, TypeError):
         return web.json_response({"error": "bad date/time"}, status=400)
 

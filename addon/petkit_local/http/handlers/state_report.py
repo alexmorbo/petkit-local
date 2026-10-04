@@ -5,7 +5,8 @@ everything it knows about itself: work state, error flags, WiFi, consumable
 levels. That single payload is what almost every Home Assistant sensor in this
 project is ultimately rendered from, so the handler's job is to get it parsed
 and into `device.state` — nothing here talks back to the device beyond the
-poll interval and a timestamp.
+poll interval and a timestamp — the latter rendered in the device's own UTC
+offset, which may be where the firmware gets its runtime offset from.
 
 The body is deliberately parsed defensively. It arrives as
 `state=<JSON>` form-urlencoded, sometimes gzip-compressed, sometimes
@@ -150,6 +151,11 @@ async def handle_state_report(request: web.Request) -> web.Response:
             # visible regression. Events carry a state snapshot of their own,
             # so the cloud can afford to be quiet and we cannot.
             "interval": 30,
-            "time": cloud_timestamp(),
+            # In the DEVICE's offset, as the real cloud sends it (`+0300` for
+            # a Moscow account, never `+0000`) — the firmware may take its
+            # runtime UTC offset from this string; see `cloud_timestamp`. A
+            # device we cannot identify gets UTC, as before.
+            "time": cloud_timestamp(
+                offset_hours=device.timezone_offset if device else None),
         }
     })

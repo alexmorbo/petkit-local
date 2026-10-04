@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any
 
 from petkit_local.devices.base import Device, Refused, encode_multi_range
@@ -221,7 +222,7 @@ LITTER_ACTIONS = {
 }
 
 
-def _feed_id(now: float | None = None) -> str:
+def _feed_id(device: Device | None = None, now: float | None = None) -> str:
     """The feed's own identifier, which is not the envelope id.
 
     Shape `r_{yyyymmdd}_{n}_{n}-1`, and the number appears TWICE:
@@ -238,10 +239,20 @@ def _feed_id(now: float | None = None) -> str:
     `20260801` — so both halves of the id are local, and a UTC one would
     disagree with the device's own reading of the same feed for most of the
     world.
+
+    "Local" is the DEVICE's zone (`Device.timezone_info`), not the
+    container's: a UTC container gave a Moscow feeder ids cut at 03:00. Only
+    a call with no device falls back to the container clock.
     """
     now = time.time() if now is None else now
-    n = int(now - local_day_start(now))
-    return f"r_{time.strftime('%Y%m%d', time.localtime(now))}_{n}_{n}-1"
+    if device is None:
+        n = int(now - local_day_start(now))
+        return f"r_{time.strftime('%Y%m%d', time.localtime(now))}_{n}_{n}-1"
+    moment = datetime.fromtimestamp(now, device.timezone_info)
+    midnight = datetime(moment.year, moment.month, moment.day,
+                        tzinfo=moment.tzinfo)
+    n = int(now - midnight.timestamp())
+    return f"r_{moment.strftime('%Y%m%d')}_{n}_{n}-1"
 
 
 def _feed(device: Device, amount1: int, amount2: int = 0) -> Command:
@@ -269,7 +280,7 @@ def _feed(device: Device, amount1: int, amount2: int = 0) -> Command:
         params = {"amount1": _clamp_byte(amount1), "amount2": _clamp_byte(amount2)}
     else:
         params = {"amount": _clamp_byte(amount1)}
-    feed_id = _feed_id()
+    feed_id = _feed_id(device)
     # Remembered so `feed_realtime_cancel` has something to name. Nothing else
     # knows it: the device echoes it back in `feed_start`/`feed_over`, but a
     # cancel is wanted precisely when neither has arrived yet.
@@ -315,9 +326,9 @@ def _cancel_feed(device: Device) -> Command:
     if device.device_type.lower() not in DEVICE_TYPES_FEEDER_NEXT_GEN:
         return ("feed_realtime", _envelope("thing.service.feed_realtime", {
             "amount": 0,
-            "id": _feed_id(),
+            "id": _feed_id(device),
         }))
-    last = (device.config.get("local") or {}).get("lastFeedId") or _feed_id()
+    last = (device.config.get("local") or {}).get("lastFeedId") or _feed_id(device)
     return ("feed_realtime_cancel", _envelope("thing.service.feed_realtime_cancel", {
         "id": last,
         "amount1": 0,

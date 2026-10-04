@@ -12,8 +12,8 @@ import time
 import pytest
 
 from petkit_local.utils.timeutil import (
-    local_day_bounds, local_day_start, local_offset_hours,
-    offset_hours_for_locale, parse_date,
+    cloud_timestamp, fixed_offset_tz, local_day_bounds, local_day_start,
+    local_offset_hours, offset_hours_for_locale, parse_date,
 )
 
 DAY = 86400
@@ -145,3 +145,33 @@ def test_unusable_locale_returns_none_for_fallback(bad):
     caller drops to the numeric sources. `UTC` has no slash and is handled by
     the numeric path's 0.0 anyway."""
     assert offset_hours_for_locale(bad, _SUMMER) is None
+
+
+# --- cloud_timestamp: the wire format, in the device's offset ----------------
+
+# 2026-10-04T15:26:53.278Z
+_INSTANT = 1791127613.278
+
+
+def test_cloud_timestamp_defaults_to_utc():
+    assert cloud_timestamp(_INSTANT) == "2026-10-04T15:26:53.278+0000"
+
+
+@pytest.mark.parametrize("offset, expected", [
+    (3, "2026-10-04T18:26:53.278+0300"),
+    (3.0, "2026-10-04T18:26:53.278+0300"),
+    (5.75, "2026-10-04T21:11:53.278+0545"),
+    (-3.5, "2026-10-04T11:56:53.278-0330"),
+    (0, "2026-10-04T15:26:53.278+0000"),
+])
+def test_cloud_timestamp_renders_the_same_instant_in_the_offset(offset, expected):
+    """PetKit's own `%z` shape: no colon, and the wall clock moved with it."""
+    assert cloud_timestamp(_INSTANT, offset_hours=offset) == expected
+
+
+@pytest.mark.parametrize("junk", [float("nan"), float("inf"), 24, -30, 1e9])
+def test_an_unusable_offset_falls_back_to_utc_without_raising(junk):
+    """The offset can be a hand-typed panel override; a device reply must
+    survive it."""
+    assert fixed_offset_tz(junk).utcoffset(None).total_seconds() == 0
+    assert cloud_timestamp(_INSTANT, offset_hours=junk).endswith("+0000")

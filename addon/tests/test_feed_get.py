@@ -1,6 +1,7 @@
 """dev_feed_get must match the real cloud's responses — 21 of them were
 captured through proxy mode from a D4SH on 2026-08-12, and the replay test
 below reproduces one to the second."""
+import datetime
 import json
 import os
 import time
@@ -311,3 +312,120 @@ def test_dual_hopper_bytes_are_untouched_by_the_renderer():
     assert body["schedule"][0]["itemJsonString"] == '[{"a1":1,"a2":6,"id":"n_46560","t":46560}]'
     push = render_feed(dual, feed, time.time(), item_json=False)
     assert push["schedule"] == [{"re": "5", "it": feed["schedule"][0]["it"]}]
+
+
+# --- whose midnight: the device's, never the container's --------------------
+
+def _pin_tz(name):
+    os.environ["TZ"] = name
+    time.tzset()
+
+
+@pytest.fixture
+def restore_tz():
+    old = os.environ.get("TZ")
+    yield _pin_tz
+    if old is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = old
+    time.tzset()
+
+
+# Sat 2026-10-03 22:00:00Z == Sun 2026-10-04 01:00 in Moscow (UTC+3).
+_MOSCOW_SUNDAY_1AM = 1791064800.0
+
+
+def _moscow_feeder(**config):
+    reg = DeviceRegistry()
+    d = reg.get_or_create(petkit_id=7, device_type="d4h", serial_number="SN7")
+    d.config.update(config)
+    return d
+
+
+@pytest.mark.parametrize("container_tz", ["UTC", "Asia/Tokyo", "Europe/Warsaw"])
+@pytest.mark.parametrize("device_config", [
+    {"timezone": 3},                      # manual override, a fixed offset
+    {"locale": "Europe/Moscow"},          # the zone name the device reported
+    {"reported_timezone": 3.0},           # the number it reported at signup
+])
+def test_latest_days_follow_the_device_not_the_container(restore_tz, container_tz,
+                                                          device_config):
+    """At 01:00 Moscow on a Sunday, a Sunday 08:00 meal is TODAY for the
+    feeder. A UTC container thought it was still Saturday and served it as
+    nothing (wrong weekday) — a Tokyo one had already moved on to Monday."""
+    from petkit_local.http.handlers.feed import render_feed
+
+    restore_tz(container_tz)
+    device = _moscow_feeder(**device_config)
+    feed = {"schedule": [
+        {"re": "1", "it": [{"id": "n_28800", "t": 28800, "a1": 1}]},  # Sun 08:00
+    ], "v": 2}
+    result = render_feed(device, feed, _MOSCOW_SUNDAY_1AM)
+    assert result["latest"] == [{"id": "s_20261004_28800", "t": 7 * 3600, "a": 10}]
+    assert result["nextTick"] == 7 * 3600
+
+
+@pytest.mark.parametrize("container_tz", ["UTC", "Asia/Tokyo"])
+def test_device_day_boundary_with_a_fractional_offset(restore_tz, container_tz):
+    """Kathmandu, +05:45: the day starts at 18:15Z the evening before."""
+    restore_tz(container_tz)
+    reg = DeviceRegistry()
+    d = reg.get_or_create(petkit_id=8, device_type="d4sh", serial_number="SN8")
+    d.config["timezone"] = 5.75
+    feed = {"schedule": [
+        {"re": "1,2,3,4,5,6,7", "it": [{"id": "n_60", "t": 60, "a1": 1, "a2": 0}]},
+    ], "v": 2}
+    # 2026-10-04T18:20:00Z == 2026-10-05 00:05 local: today's 00:01 has passed,
+    # so the only instances are tomorrow's (Oct 6) — nothing from Oct 5.
+    now = 1791138000.0
+    latest = _build_latest(feed, now, d.timezone_info)
+    assert [e["id"] for e in latest] == ["s_20261006_60"]
+    assert latest[0]["t"] == 86400 - 4 * 60
+
+
+def test_dst_change_inside_the_window_uses_the_named_zone(restore_tz):
+    """A device that reported `Europe/Warsaw` keeps its real midnight across
+    the autumn change (25-hour Sunday), so Monday's day starts at its real
+    midnight, an hour later than a fixed +02:00 would put it."""
+    restore_tz("UTC")
+    reg = DeviceRegistry()
+    d = reg.get_or_create(petkit_id=9, device_type="d4sh", serial_number="SN9")
+    d.config["locale"] = "Europe/Warsaw"
+    feed = {"schedule": [
+        {"re": "1,2,3,4,5,6,7", "it": [{"id": "n_28800", "t": 28800, "a1": 1, "a2": 0}]},
+    ], "v": 2}
+    # Sun 2026-10-25 00:30 CEST == 22:30Z Sat; DST ends at 03:00 that night.
+    now = 1792881000.0
+    latest = _build_latest(feed, now, d.timezone_info)
+    by_id = {e["id"]: e["t"] for e in latest}
+    # `t` is added to midnight as elapsed seconds, so the 25-hour day's own
+    # meal lands 8h after its CEST midnight (07:00 CET), as it always has.
+    # Whether the firmware fires by elapsed seconds or by wall clock on such
+    # a day is UNVERIFIED; this pins the existing behaviour, not a capture.
+    assert by_id["s_20261025_28800"] == 7.5 * 3600
+    # Monday's midnight is CET: 32.5h away, where a fixed +02:00 says 31.5h.
+    assert by_id["s_20261026_28800"] == 32.5 * 3600
+
+
+@pytest.mark.parametrize("config, expected", [
+    ({"timezone": 3, "locale": "Europe/Warsaw"}, 3 * 3600),  # override wins
+    ({"locale": "Bad/Zone", "reported_timezone": 3}, 3 * 3600),
+    ({"locale": "Asia/Kathmandu", "reported_timezone": 0}, 5.75 * 3600),
+])
+def test_timezone_info_follows_timezone_offset_precedence(config, expected):
+    reg = DeviceRegistry()
+    d = reg.get_or_create(petkit_id=10, device_type="d4h", serial_number="SN10")
+    d.config.update(config)
+    offset = d.timezone_info.utcoffset(datetime.datetime(2026, 7, 1))
+    assert offset.total_seconds() == expected == d.timezone_offset * 3600
+
+
+def test_a_device_stand_in_without_a_zone_keeps_the_container_clock(restore_tz):
+    from petkit_local.http.handlers.feed import render_feed
+
+    restore_tz("Europe/Warsaw")
+    feed = {"schedule": [
+        {"re": "5", "it": [{"id": "n_46560", "t": 46560, "a1": 1, "a2": 0}]},
+    ], "v": 2}
+    assert render_feed(object(), feed, CAPTURE_TS)["latest"] == [CLOUD_LATEST[0]]

@@ -19,6 +19,7 @@ dependency or a configured zone name.
 """
 from __future__ import annotations
 
+import math
 import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -27,16 +28,50 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 DATE_FORMAT = "%Y-%m-%d"
 
 
-def cloud_timestamp(when: float | None = None) -> str:
-    """A UTC instant in the format PetKit's cloud puts on the wire.
+def fixed_offset_tz(offset_hours: float | None) -> timezone:
+    """A fixed-offset tzinfo for `offset_hours` east of UTC, UTC if unusable.
 
-    `2026-07-15T05:19:42.000+0000` — milliseconds, and a `+0000` offset with no
-    colon. NOT `datetime.isoformat()`, which produces `+00:00` and would be a
-    different string to whatever parses it on the device. Confirmed against
-    captured `dev_state_report` and `dev_schedule_get` replies.
+    Rounded to whole minutes, because that is all `%z` can say without
+    growing a seconds field the wire format does not have (`5.75` -> `+0545`).
+    Never raises: the value can be a panel override or a device report, and a
+    NaN, an infinity or anything a `timezone` refuses (|offset| >= 24h) falls
+    back to UTC rather than taking a device reply down with it.
     """
-    now = datetime.fromtimestamp(when, timezone.utc) if when is not None \
-        else datetime.now(timezone.utc)
+    if offset_hours is None or not math.isfinite(offset_hours):
+        return timezone.utc
+    minutes = round(offset_hours * 60)
+    if not -24 * 60 < minutes < 24 * 60:
+        return timezone.utc
+    return timezone(timedelta(minutes=minutes))
+
+
+def cloud_timestamp(when: float | None = None,
+                    offset_hours: float | None = None) -> str:
+    """An instant in the format PetKit's cloud puts on the wire.
+
+    `2026-07-15T05:19:42.000+0000` — milliseconds, and a `±HHMM` offset with no
+    colon. NOT `datetime.isoformat()`, which produces `+00:00` and would be a
+    different string to whatever parses it on the device. That SHAPE was
+    confirmed against captured `dev_state_report` and `dev_schedule_get`
+    replies; their `+0000` most likely came from a UTC account.
+
+    `offset_hours` renders the same instant in that fixed offset instead of
+    UTC (`3` -> `...T18:26:53.278+0300`). The cloud does this: for a
+    Europe/Moscow account all 205 logged `time` fields it sent in state-report
+    replies (MQTT `user/get`, `{"msgType":0,...,"type":"<type>_state_report"}`,
+    W7H and D4H, 2026-09-16..10-04) carry `+0300`, never `+0000`.
+    It matters if the firmware takes its runtime UTC offset from this string's
+    `%z` — a HYPOTHESIS, not proven: the device's reported `timezone` drifted
+    3.0 -> 0.0 within hours of being served `+0000` and back to 3.0 once proxy
+    mode relayed the cloud's `+0300`, and the camera watermark followed.
+    The evidence is the cloud's MQTT push, which we do not send; the HTTP
+    `dev_state_report` reply carries the same field and is matched for
+    parity. Confirm on a live device — which channel, if either — before
+    treating it as settled. Absent, the default stays UTC.
+    """
+    tz = fixed_offset_tz(offset_hours)
+    now = datetime.fromtimestamp(when, tz) if when is not None \
+        else datetime.now(tz)
     return (now.strftime("%Y-%m-%dT%H:%M:%S.")
             + f"{now.microsecond // 1000:03d}"
             + now.strftime("%z"))
@@ -51,6 +86,17 @@ def local_offset_hours(when: float | None = None) -> float:
     moment = datetime.fromtimestamp(when) if when is not None else datetime.now()
     offset = moment.astimezone().utcoffset()
     return offset.total_seconds() / 3600 if offset is not None else 0.0
+
+
+def zone_for_locale(locale: str | None) -> ZoneInfo | None:
+    """The IANA zone a device's `locale` names, or None (rules as below)."""
+    if not isinstance(locale, str) or "/" not in locale:
+        return None
+    try:
+        return ZoneInfo(locale)
+    except (ZoneInfoNotFoundError, ValueError):
+        # Unknown zone, or a name the OS tz database does not carry.
+        return None
 
 
 def offset_hours_for_locale(locale: str | None,
@@ -69,12 +115,8 @@ def offset_hours_for_locale(locale: str | None,
     with no `/`, which no real zone this matters for lacks — `UTC` included,
     whose 0 the numeric path already yields) so the caller can fall back.
     """
-    if not isinstance(locale, str) or "/" not in locale:
-        return None
-    try:
-        tz = ZoneInfo(locale)
-    except (ZoneInfoNotFoundError, ValueError):
-        # Unknown zone, or a name the OS tz database does not carry.
+    tz = zone_for_locale(locale)
+    if tz is None:
         return None
     moment = datetime.fromtimestamp(when, tz) if when is not None \
         else datetime.now(tz)

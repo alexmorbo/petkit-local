@@ -244,5 +244,11 @@ BuildKit's own `TARGETARCH` (which is what the 32-bit-ARM glibc base does).
   only field in a whole run of `===== set X (%d) =====` handlers read as `%s`. Readback is LOSSY —
   the device reports its own `%.1f`, so `5.75` comes back as `5.8`. HTTP `dev_device_info` still
   wants a NUMBER for the same field.
+  A third channel is suspected, not proven: the `%z` of a state-report reply's `time` string. The
+  cloud's MQTT `user/get` push (`msgType` 0, `<type>_state_report`) carries it in the account's
+  offset (`+0300`, 205/205 for a Moscow account, W7H and D4H), and a device served our `+0000`
+  drifted to `timezone: 0` within hours. We send no such MQTT push; the HTTP `dev_state_report`
+  reply has the same field and `utils/timeutil.cloud_timestamp` now renders it in
+  `Device.timezone_offset`. Which channel the firmware reads, if either, needs hardware.
 - **K2/K3 entity definitions assume a WiFi purifier** that does not exist — both models are
   BLE-only today.

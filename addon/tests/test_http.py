@@ -881,3 +881,44 @@ async def test_a_device_offering_nothing_stable_is_still_refused():
         assert not reg.all()
     finally:
         await client.close()
+
+
+# --- the state-report reply's `time` carries the device's own offset ---------
+#
+# The real cloud answers a Europe/Moscow account's state reports with `+0300`
+# (205 of 205 logged replies, W7H and D4H), and the device's own timezone has
+# been seen to follow whichever offset it was last served.
+
+async def _state_report_time(reg, headers):
+    client = await _client(reg)
+    try:
+        r = await client.post("/6/t5/dev_state_report", headers=headers,
+                              data=json.dumps({"workState": 0}))
+        assert r.status == 200
+        return (await r.json())["result"]["time"]
+    finally:
+        await client.close()
+
+
+async def test_state_report_time_is_in_the_device_offset():
+    for offset, suffix in ((3, "+0300"), (5.75, "+0545"), (0, "+0000")):
+        reg = DeviceRegistry()
+        dev = reg.get_or_create(petkit_id=100, device_type="t5", serial_number="SN100")
+        dev.config["timezone"] = offset
+        stamp = await _state_report_time(reg, HDR)
+        assert stamp.endswith(suffix), (offset, stamp)
+        # Still the exact wire shape: milliseconds, no colon in the offset.
+        assert len(stamp) == len("2026-10-04T18:26:53.278+0300")
+
+
+async def test_state_report_time_follows_a_reported_locale():
+    reg = DeviceRegistry()
+    dev = reg.get_or_create(petkit_id=100, device_type="t5", serial_number="SN100")
+    dev.config["locale"] = "Europe/Moscow"
+    dev.config["reported_timezone"] = 0.0
+    assert (await _state_report_time(reg, HDR)).endswith("+0300")
+
+
+async def test_state_report_time_for_an_unknown_device_is_utc():
+    stamp = await _state_report_time(DeviceRegistry(), {"X-Device": "id=999&sn=NOPE"})
+    assert stamp.endswith("+0000")

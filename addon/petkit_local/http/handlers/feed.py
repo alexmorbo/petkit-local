@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, tzinfo
 
 from aiohttp import web
 
@@ -58,15 +59,30 @@ _D4H_AMOUNT_PER_PORTION = 10
 _AMOUNT_BYTE_MAX = 255
 
 
-def _local_midnight(now: float, day_offset: int) -> float:
-    """Local midnight ``day_offset`` days after the day containing ``now``.
+def _local_midnight(now: float, day_offset: int,
+                    tz: tzinfo | None = None) -> float:
+    """Midnight ``day_offset`` days after the day containing ``now``, in ``tz``.
 
-    Re-localized through ``mktime`` rather than ``+ 86400`` — DST makes days
-    23 and 25 hours long.
+    ``tz`` is the DEVICE's zone (`Device.timezone_info`): a feeder fires its
+    meals on its own clock, so "today" is the device's day, not the
+    container's — a UTC container cut a Moscow feeder's day at 03:00 local.
+    None keeps the container's own clock, for a caller with no device.
+
+    Re-localized rather than ``+ 86400``: in a named zone (or the container's
+    own) DST makes days 23 and 25 hours long. A fixed offset has no DST.
     """
-    lt = time.localtime(now)
-    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + day_offset,
-                        0, 0, 0, 0, 0, -1))
+    if tz is None:
+        lt = time.localtime(now)
+        return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + day_offset,
+                            0, 0, 0, 0, 0, -1))
+    day = datetime.fromtimestamp(now, tz).date() + timedelta(days=day_offset)
+    return datetime(day.year, day.month, day.day, tzinfo=tz).timestamp()
+
+
+def _device_tz(device) -> tzinfo | None:
+    """The device's zone, or None (container clock) for a stand-in without one."""
+    tz = getattr(device, "timezone_info", None)
+    return tz if isinstance(tz, tzinfo) else None
 
 
 def migrate_minute_schedule(feed: dict) -> bool:
@@ -97,8 +113,12 @@ def migrate_minute_schedule(feed: dict) -> bool:
     return True
 
 
-def _build_latest(feed: dict, now: float) -> list[dict]:
+def _build_latest(feed: dict, now: float,
+                  tz: tzinfo | None = None) -> list[dict]:
     """Compute ``latest[]``: every feed firing today or tomorrow, local days.
+
+    "Local" is ``tz``, the device's zone (see `_local_midnight`); it decides
+    where each day starts, its weekday, and the date in an ``s_`` id.
 
     Both kinds land here — ``s_`` instances of recurring meals and ``d_``
     deferred feeds — sorted by countdown. ``t`` is ``floor(fire - now)``,
@@ -113,13 +133,16 @@ def _build_latest(feed: dict, now: float) -> list[dict]:
     Expired deferred feeds are pruned from ``feed`` as a side effect.
     """
     result = []
-    cutoff = _local_midnight(now, 2)  # end of tomorrow
+    cutoff = _local_midnight(now, 2, tz)  # end of tomorrow
 
     for day_offset in (0, 1):
-        day_start = _local_midnight(now, day_offset)
-        # PetKit weekday: Sunday=1 .. Saturday=7; tm_wday: Monday=0.
-        pk_wd = (time.localtime(day_start + 43200).tm_wday + 2) % 7 or 7
-        date_str = time.strftime("%Y%m%d", time.localtime(day_start + 43200))
+        day_start = _local_midnight(now, day_offset, tz)
+        # Noon of that day, in the same zone, names it.
+        noon = datetime.fromtimestamp(day_start + 43200, tz) if tz is not None \
+            else datetime.fromtimestamp(day_start + 43200)
+        # PetKit weekday: Sunday=1 .. Saturday=7; weekday(): Monday=0.
+        pk_wd = (noon.weekday() + 2) % 7 or 7
+        date_str = noon.strftime("%Y%m%d")
         for group in feed.get("schedule") or []:
             if not isinstance(group, dict):
                 continue
@@ -292,7 +315,7 @@ def render_feed(device, feed: dict, now: float, *, item_json: bool = True) -> di
     so their bytes do not change. A D4H gets each meal rewritten to the
     single-``a`` shape, in ``it``, ``itemJsonString`` and ``latest`` alike.
     """
-    latest = _build_latest(feed, now)
+    latest = _build_latest(feed, now, _device_tz(device))
     next_tick = _compute_next_tick(latest)
 
     if not is_single_hopper(device):

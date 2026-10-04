@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **A device's state-report reply now carries the device's own UTC offset.**
+  The `time` field went out as UTC (`...+0000`) to every device. PetKit's cloud
+  renders it in the account's offset instead: all 205 replies logged for a
+  Europe/Moscow account, W7H and D4H alike, read `+0300`. The device's own
+  `timezone` was seen falling back to 0 within hours of being served `+0000`,
+  and the camera watermark with it, then returning to 3 once proxy mode relayed
+  the cloud's `+0300`. Those replies are the cloud's MQTT `user/get` push
+  (`msgType` 0, `<type>_state_report`), which petkit-local does not send; the
+  HTTP `dev_state_report` reply carries the same field and now matches it. That
+  the firmware reads its offset from this string, and from which of the two
+  channels, is not proven yet. A device we cannot identify still gets UTC.
+
+- **Feeder schedules count "today" on the feeder's clock, not the container's.**
+  Which meals are listed as due today or tomorrow, their weekday and the date
+  in their ids used the add-on container's timezone, so a container on UTC cut
+  a Moscow feeder's day at 03:00. They now follow the device's timezone, and
+  when the device reported a zone name (`Europe/Warsaw`), that zone, DST
+  included. The same goes for the id of a manual feed and the fire time of a
+  one-off scheduled feed.
+
 - **The W7H fountain's controls now match the official app**, checked against a
   capture of PetKit's app driving a real W7H (firmware 456) on 2026-10-04, every
   screen of it. The protocol facts are graded `confirmed` in `events/codes.py`.
