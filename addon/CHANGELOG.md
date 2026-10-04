@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Proxy mode now teaches Home Assistant the settings you change in PetKit's
+  app.** A W7H reports none of its settings, so most of its controls read
+  unknown until set from HA. With proxy mode on, every setting the cloud sends
+  the device (`property.set` over MQTT, and the `settings` block of a proxied
+  `dev_device_info`) is now recorded the same way an HA write is, and the
+  entities and the panel's schedule editor update, the Quiet ... Hours windows
+  included. Only fields the device has a control for are kept, the cloud's
+  `timezone` is ignored, and the device receives exactly what it did before.
+  `dev_device_info` only fills settings never set, so it cannot undo a change
+  made from HA while proxied. This applies to every model, though only the W7H
+  needed it. Each learned value is logged
+  (`learned <field>=<value> from ...`). Nothing changes with proxy mode off.
+
+- **W7H Drain & Refill Cycle and Drain & Flush Cycle run 1-7 days**, the
+  official app's range for both pickers (fw 456). They were 1-30.
+
 - **A device's state-report reply now carries the device's own UTC offset.**
   The `time` field went out as UTC (`...+0000`) to every device. PetKit's cloud
   renders it in the account's offset instead: all 205 replies logged for a

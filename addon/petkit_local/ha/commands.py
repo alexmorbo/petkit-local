@@ -25,7 +25,7 @@ from datetime import datetime
 from typing import Any
 
 from petkit_local.devices.base import Device, Refused, encode_multi_range
-from petkit_local.devices.defaults import multi_config_ranges
+from petkit_local.devices.defaults import DAY_MINUTES, multi_config_ranges
 from petkit_local.devices.state_parsers import record_consumable_reset
 from petkit_local.events import codes
 from petkit_local.ha.discovery import EntityDef
@@ -67,8 +67,6 @@ LOCAL_VALUE_PREFIX = "local."
 # with `property.set` in the JSON-string shape every range field takes.
 MULTI_RANGE_VALUE_PREFIX = "multi_config."
 
-#: Minutes in a day. A range runs 0..1440 inclusive; 1440 is the end of the day.
-DAY_MINUTES = 24 * 60
 
 # `surplusControl` value -> the `surplusStandard` level it pairs with, from a
 # live D4SH capture of the app's own writes (2026-08-08). `0` (off) has no
@@ -605,6 +603,27 @@ def _bounds_text(entity: EntityDef) -> str:
     return f"at most {entity.max_value}"
 
 
+def store_setting(device: Device, field: str, value: Any) -> None:
+    """Record one `settings` field as the device's current value.
+
+    The optimistic write every settings control makes, and the one proxy mode's
+    observer makes for a value the official app sent (`ha/learn.py`): both are
+    a value the device has just been told, so both land where
+    `to_device_info` and the HA entities read it.
+    """
+    device.config.setdefault("settings", {})[field] = value
+
+
+def store_multi_range(device: Device, target: str, value: list) -> None:
+    """Record one `*MultiRange` window where `dev_multi_config` serves it from.
+
+    `config["multi_config"]`, not settings — see `MULTI_RANGE_VALUE_PREFIX`.
+    The text entities, the panel's schedule editor and `ha/learn.py` all write
+    through here, so all of them show the same window.
+    """
+    device.config.setdefault("multi_config", {})[target] = value
+
+
 def handle_ha_command(device: Device, entity: EntityDef, payload: str) -> Command | None:
     """Route one HA command for `entity`, mutating `device` where it applies.
 
@@ -671,7 +690,7 @@ def handle_ha_command(device: Device, entity: EntityDef, payload: str) -> Comman
         if ranges is None:
             raise Refused(f"{entity.name} must be HH:MM-HH:MM ranges, comma separated "
                           f"(e.g. 22:00-07:00), or empty for none")
-        device.config.setdefault("multi_config", {})[target] = ranges
+        store_multi_range(device, target, ranges)
         log.info("Setting %s=%s for device %d (stored + MQTT)",
                  target, ranges, device.petkit_id)
         return (PROPERTY_SET_SUFFIX, make_mqtt_property_set(
@@ -779,6 +798,6 @@ def handle_ha_command(device: Device, entity: EntityDef, payload: str) -> Comman
         log.warning("Could not coerce payload %r for entity '%s'", payload, entity.key)
         return None
 
-    device.config.setdefault("settings", {})[field] = value
+    store_setting(device, field, value)
     log.info("Setting %s=%s for device %d (optimistic + MQTT)", field, value, device.petkit_id)
     return (PROPERTY_SET_SUFFIX, make_mqtt_property_set({field: value}))
