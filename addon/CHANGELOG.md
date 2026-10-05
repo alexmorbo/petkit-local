@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **A pet can now be put on more devices from its card.** Pick a device next
+  to its chips and press "Add device", or press the × on a chip to take it
+  off. Nothing is pushed: the device reads its pet list at its next check
+  (boot, or about hourly; a reboot forces it). Removing the last device is
+  allowed; the pet is then recognised by no box, weight matching unchanged.
+
+- **Adding a pet whose name already exists offers to add the device to it
+  instead.** Two pets of the same name were almost always one cat added once
+  per box, and two pets with the same reference weight tie every visit, so
+  weight matching named neither. The panel now asks first; creating a second,
+  separate pet stays possible. Adding the device to the existing pet keeps
+  that pet's reference weight — a weight typed into the form is not applied,
+  and the toast says so. The API answers `POST /api/pets` with a taken
+  name (trimmed, any case) with 409 and the `existing_id`, unless the body
+  sets `allow_duplicate`. Cloud import is unaffected.
+
+- **The Pets tab warns when two reference weights are within 100 g.** Visits
+  between them land on the wrong pet, and an exact tie goes to nobody. The
+  warning names both pets; nothing stops you saving. `GET /api/pets`, and a
+  create or weight update, return the pairs as `weight_conflicts`.
+
+- **Deleting a pet, a BLE accessory or a device now removes it from Home
+  Assistant.** Every discovery config gets an empty retained payload, and so do
+  its state and availability (and a camera device's retained Last Snapshot
+  image), so the HA device goes away instead of lingering as unavailable. If
+  HA's broker is down at the time, the removal goes out as soon as it
+  reconnects (it is lost if the add-on restarts first; delete the device in HA
+  by hand then). With no HA broker configured nothing is queued. Deleting a
+  device never did this before at all: the handler looked up the publisher
+  under the wrong name.
+
 - **Litter-box visits without a face match go to a pet by weight.** A T6 has
   no camera, so every visit it reported was anonymous. Give each pet a
   reference weight in the Pets tab (click "set weight" next to its name): a

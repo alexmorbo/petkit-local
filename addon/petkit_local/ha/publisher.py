@@ -34,7 +34,7 @@ from petkit_local.ha.categories import get_entities_for_device, get_retired_enti
 from petkit_local.ha.command_router import CommandRouter
 from petkit_local.ha.entities.ble import get_ble_entities
 from petkit_local.ha.entities.pet import PET_SENSORS
-from petkit_local.ha.discovery import build_discovery_payload, discovery_topic
+from petkit_local.ha.discovery import build_discovery_payload, discovery_topic, image_topic
 from petkit_local.devices.state_parsers import apply_consumable_state
 from petkit_local.ha.commands import LOCAL_DEFAULTS, multi_config_texts
 from petkit_local.utils.jsonio import read_bytes
@@ -48,6 +48,19 @@ if TYPE_CHECKING:
     from petkit_local.web.hub import EventHub
 
 log = logging.getLogger(__name__)
+
+
+def _pet_state_topic(pet_id: int) -> str:
+    return f"petkit-local/pet/{pet_id}/state"
+
+
+def _pet_availability_topic(pet_id: int) -> str:
+    return f"petkit-local/pet/{pet_id}/availability"
+
+
+def _device_topic(petkit_id: int, suffix: str) -> str:
+    """`petkit-local/{id}/{suffix}` -- a device's or BLE accessory's own topics."""
+    return f"petkit-local/{petkit_id}/{suffix}"
 
 
 def _iso(ts: float | None) -> str | None:
@@ -87,6 +100,12 @@ class HAPublisher:
 
     The other direction — what HA writes back — is `ha/command_router.py`,
     which this class owns, subscribes for and hands its messages to.
+
+    `unpublish_pet` / `unpublish_ble` / `unpublish_discovery` are the one path that does not silently
+    drop while disconnected: a removal that cannot reach HA is queued
+    (`_pending_clears`) and flushed on the next connect, before anything is
+    republished, because the broker keeps the retained configs and HA would
+    otherwise keep -- or re-create -- the deleted thing.
     """
 
     def __init__(self, registry: DeviceRegistry, config: dict[str, Any],
@@ -124,6 +143,22 @@ class HAPublisher:
         self._commands = CommandRouter(self, registry, ble_registry)
         self._pets: PetRegistry | None = None
         self._pet_store: EventStore | None = None
+        #: Retained topics still to be emptied, per deleted pet, BLE accessory or
+        #: device: `{("pet" | "ble" | "device", id): [topic, ...]}`. A delete while HA's broker
+        #: link is down would otherwise be a silent no-op, and the broker keeps
+        #: the retained configs -- the ghost would come straight back. Flushed on
+        #: every connect. In memory only: an add-on restart during an HA outage
+        #: loses them (delete the device in HA by hand then).
+        self._pending_clears: dict[tuple[str, int], list[str]] = {}
+        #: False when `start()` will never connect (no `ha_mqtt_host`, or
+        #: aiomqtt missing): the unpublish methods then queue nothing, since
+        #: nothing would ever flush it, and answer None.
+        self._enabled = bool(self._host)
+
+    @property
+    def enabled(self) -> bool:
+        """Whether this publisher can ever reach HA (a broker is configured)."""
+        return self._enabled
 
     @property
     def connected(self) -> bool:
@@ -169,6 +204,8 @@ class HAPublisher:
             import aiomqtt  # noqa: PLC0415 - optional dependency, probed at use
         except ImportError:
             log.warning("aiomqtt not installed - HA MQTT publishing disabled")
+            self._enabled = False
+            self._pending_clears.clear()
             return
 
         fails = 0
@@ -186,6 +223,9 @@ class HAPublisher:
                     fails = 0
                     log.info("Connected to HA MQTT broker at %s:%d", self._host, self._port)
 
+                    # Removals first, then what exists now -- so anything that
+                    # exists always wins over a stale tombstone.
+                    await self._flush_pending_clears()
                     await self._publish_all_discovery()
 
                     await client.subscribe("petkit-local/+/cmd/+")
@@ -287,6 +327,10 @@ class HAPublisher:
 
     async def publish_discovery(self, device: Device) -> None:
         """Announce every entity of `device` and rebuild its command index."""
+        if ("device", device.petkit_id) in self._pending_clears:
+            # The same device registered again (ids are the device's own).
+            self._cancel_pending_clear(("device", device.petkit_id),
+                                       self._device_clear_topics(device))
         if not self._client or not self._connected:
             return
 
@@ -319,23 +363,24 @@ class HAPublisher:
         log.info("Published %d discovery configs for %s (id=%d), cleared %d retired",
                  len(entities), device.device_type, device.petkit_id, len(retired))
 
-    async def unpublish_discovery(self, device: Device) -> None:
-        """Remove every HA entity of `device` by publishing empty payloads."""
-        if not self._client or not self._connected:
-            return
+    async def unpublish_discovery(self, device: Device) -> bool | None:
+        """Remove every HA entity of `device` by publishing empty payloads.
 
-        entities = get_entities_for_device(device)
+        Queued like `unpublish_pet` when HA's broker is down. Returns whether
+        it reached HA now; None when publishing is off.
+        """
         self._commands.clear_entities(device.petkit_id)
+        return await self._queue_clear(("device", device.petkit_id),
+                                       self._device_clear_topics(device))
 
-        for entity in entities:
-            topic = discovery_topic(entity, device.petkit_id, self._prefix)
-            await self._emit(topic, "", retain=True)
-
-        for suffix in ("state", "availability"):
-            await self._emit(f"petkit-local/{device.petkit_id}/{suffix}", "", retain=True)
-
-        log.info("Unpublished %d discovery configs for %s (id=%d)",
-                 len(entities), device.device_type, device.petkit_id)
+    def _device_clear_topics(self, device: Device) -> list[str]:
+        """Every retained topic a device's HA device uses: each discovery
+        config, the raw bytes of its `image` entities, state, availability."""
+        entities = get_entities_for_device(device)
+        return ([discovery_topic(e, device.petkit_id, self._prefix) for e in entities]
+                + [image_topic(e, device.petkit_id) for e in entities if e.component == "image"]
+                + [_device_topic(device.petkit_id, "state"),
+                   _device_topic(device.petkit_id, "availability")])
 
     async def _emit(self, topic: str, payload: Any, *, retain: bool = True) -> bool:
         """Publish one message, never raising. Returns whether it went out.
@@ -447,13 +492,99 @@ class HAPublisher:
         """
         return [f"petkit_pet_{pet_id}"]
 
+    def _pet_config_topics(self, pet_id: int) -> list[str]:
+        """Every retained discovery config topic a pet's HA device uses."""
+        ids = self._pet_identifiers(pet_id)
+        return [discovery_topic(e, pet_id, self._prefix, identifiers=ids) for e in PET_SENSORS]
+
+    def _ble_config_topics(self, ble_dev: BLEDevice) -> list[str]:
+        """Every retained discovery config topic a BLE accessory's HA device uses."""
+        return [discovery_topic(e, ble_dev.petkit_id, self._prefix)
+                for e in get_ble_entities(ble_dev.ble_type)]
+
+    def _cancel_pending_clear(self, key: tuple[str, int], republished: list[str]) -> None:
+        """A pet/accessory is being published again: never clear what it now uses.
+
+        Pet ids are never reused, but a BLE id is (re-pairing the same
+        accessory), so a tombstone queued while HA was down must not empty the
+        configs of the accessory that came back. Topics the new publish does
+        NOT cover (a different accessory type under the same id) stay queued.
+        """
+        pending = self._pending_clears.get(key)
+        if pending is None:
+            return
+        covered = set(republished)
+        keep = [t for t in pending if t not in covered]
+        if keep:
+            self._pending_clears[key] = keep
+        else:
+            self._pending_clears.pop(key, None)
+
+    async def unpublish_pet(self, pet_id: int) -> bool | None:
+        """Remove a deleted pet's HA device: empty retained configs, state, availability.
+
+        Returns True if it reached HA now; False means it is queued for the
+        next connect; None means publishing is off (no broker configured), so
+        there is nothing to remove and nothing is queued. Never raises.
+        """
+        return await self._queue_clear(("pet", pet_id), self._pet_config_topics(pet_id) + [
+            _pet_state_topic(pet_id), _pet_availability_topic(pet_id)])
+
+    async def unpublish_ble(self, ble_dev: BLEDevice) -> bool | None:
+        """Remove an unpaired BLE accessory's HA device, like `unpublish_pet`."""
+        self._commands.clear_entities(ble_dev.petkit_id)
+        return await self._queue_clear(("ble", ble_dev.petkit_id),
+                                       self._ble_config_topics(ble_dev) + [
+                                           _device_topic(ble_dev.petkit_id, "state"),
+                                           _device_topic(ble_dev.petkit_id, "availability")])
+
+    async def _queue_clear(self, key: tuple[str, int], topics: list[str]) -> bool | None:
+        if not self._enabled:
+            return None
+        self._pending_clears[key] = topics
+        return await self._flush_pending_clears()
+
+    async def _flush_pending_clears(self) -> bool:
+        """Publish empty retained payloads for every pending tombstone. Never raises.
+
+        A key is dropped only once ALL its topics went out (`_emit` returns
+        False and drops `_connected` on failure, so the rest waits for the next
+        connect). Re-sending a topic that already went out is harmless.
+
+        Every `_emit` awaits, so a publish of the same id can cancel part of a
+        tombstone mid-flush: each topic is re-checked against the live entry
+        before it is emptied, and only what went out is removed from it.
+        """
+        for key in list(self._pending_clears):
+            sent: set[str] = set()
+            for topic in list(self._pending_clears.get(key) or ()):
+                if topic not in self._pending_clears.get(key, ()):
+                    continue  # re-published meanwhile -- it is live again
+                if not await self._emit(topic, "", retain=True):
+                    log.info("HA not connected; %s %d will be removed from Home Assistant "
+                             "on reconnect", *key)
+                    return False
+                sent.add(topic)
+            left = [t for t in self._pending_clears.get(key, ()) if t not in sent]
+            if left:
+                self._pending_clears[key] = left
+            else:
+                self._pending_clears.pop(key, None)
+            log.info("Removed %s %d from Home Assistant (%d retained topics cleared)",
+                     key[0], key[1], len(sent))
+        return True
+
     async def publish_pet_discovery(self, pet: dict) -> None:
         """Announce a pet as its own virtual HA device (see ai/pets.py)."""
+        state_topic = _pet_state_topic(pet["id"])
+        avail_topic = _pet_availability_topic(pet["id"])
+        # Before the connection guard, so a pet published while offline still
+        # cancels a tombstone the next connect would otherwise flush.
+        self._cancel_pending_clear(("pet", pet["id"]), self._pet_config_topics(pet["id"])
+                                   + [state_topic, avail_topic])
         if not self._client or not self._connected:
             return
         identifiers = self._pet_identifiers(pet["id"])
-        state_topic = f"petkit-local/pet/{pet['id']}/state"
-        avail_topic = f"petkit-local/pet/{pet['id']}/availability"
 
         for entity in PET_SENSORS:
             topic = discovery_topic(entity, pet["id"], self._prefix, identifiers=identifiers)
@@ -498,8 +629,7 @@ class HAPublisher:
                 "drinksToday": stats.get("drinks_today", 0),
             }
         }
-        topic = f"petkit-local/pet/{pet['id']}/state"
-        await self._emit(topic, json.dumps(state), retain=True)
+        await self._emit(_pet_state_topic(pet["id"]), json.dumps(state), retain=True)
 
     def _relative_media_path(self, path: str) -> str:
         """Path as HA's media browser addresses it: relative to the media root.
@@ -522,6 +652,11 @@ class HAPublisher:
         the WiFi device it is linked to — but it gets a separate HA device so
         its battery/consumables don't masquerade as the parent's.
         """
+        # Before the connection guard: a re-pair while offline must still
+        # cancel the tombstone of the accessory that used this id before.
+        self._cancel_pending_clear(("ble", ble_dev.petkit_id), self._ble_config_topics(ble_dev) + [
+            _device_topic(ble_dev.petkit_id, "state"),
+            _device_topic(ble_dev.petkit_id, "availability")])
         if not self._client or not self._connected:
             return
         entities = get_ble_entities(ble_dev.ble_type)

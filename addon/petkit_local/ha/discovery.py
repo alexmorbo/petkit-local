@@ -260,10 +260,15 @@ def build_discovery_payload(
         # here directly: the bytes are the entity's whole content.
         payload.pop("value_template", None)
         payload.pop("state_topic", None)
-        payload["image_topic"] = f"petkit-local/{device_id}/{entity.unique_id_suffix}"
+        payload["image_topic"] = image_topic(entity, device_id)
         payload["content_type"] = "image/jpeg"
 
     return payload
+
+
+def image_topic(entity: EntityDef, device_id: int) -> str:
+    """Retained topic an `image` entity's raw JPEG bytes live on."""
+    return f"petkit-local/{device_id}/{entity.unique_id_suffix}"
 
 
 def discovery_topic(entity: EntityDef, device_id: int, prefix: str = "homeassistant",

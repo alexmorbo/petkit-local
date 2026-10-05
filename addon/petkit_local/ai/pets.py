@@ -107,6 +107,30 @@ WEIGHT_OUTLIER_GUARD_G = 1000.0
 #: because there is nothing to pick between.
 WEIGHT_AMBIGUITY_MARGIN_G = 0.0
 
+#: Two reference weights this close make weight attribution unreliable: a cat's
+#: weighed visits scatter by about this much, so visits between the two flip
+#: from one pet to the other, and an exact tie attributes nobody. Only a
+#: warning -- nothing refuses such a reference.
+WEIGHT_CONFLICT_G = 100.0
+
+
+def weight_conflicts(refs: Mapping[int, float], *,
+                     within_g: float = WEIGHT_CONFLICT_G) -> list[tuple[int, int, float]]:
+    """Pairs of pets whose reference weights are within `within_g` (inclusive).
+
+    `(lower_id, higher_id, |difference|)`, sorted by ids. Every pet counts, not
+    only pets sharing a device: `attribute` matches a visit against every
+    reference (`weight_references`), see `nearest_pet_by_weight`.
+    """
+    items = sorted(refs.items())
+    out: list[tuple[int, int, float]] = []
+    for i, (a, wa) in enumerate(items):
+        for b, wb in items[i + 1:]:
+            diff = abs(wa - wb)
+            if diff <= within_g:
+                out.append((a, b, diff))
+    return out
+
 
 def nearest_pet_by_weight(weight_g: float | None, refs: Mapping[int, float], *,
                           guard_g: float = WEIGHT_OUTLIER_GUARD_G,

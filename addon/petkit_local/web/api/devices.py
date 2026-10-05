@@ -519,9 +519,15 @@ async def api_device_delete(request: web.Request) -> web.Response:
     d = _device_or_404(request)
     did = d.petkit_id
 
-    publisher = request.app.get("publisher")
+    # "ha_publisher" / "hub" are the panel's keys (web/appkeys.py). This read
+    # "publisher" / "event_hub" for a long time, so deleting a device never
+    # removed it from HA nor from the live log.
+    publisher = request.app.get("ha_publisher")
     if publisher:
-        await publisher.unpublish_discovery(d)
+        try:
+            await publisher.unpublish_discovery(d)
+        except Exception:
+            log.warning("Removing device %d from Home Assistant failed", did, exc_info=True)
 
     ble = request.app.get("ble_registry")
     orphaned = []
@@ -531,7 +537,7 @@ async def api_device_delete(request: web.Request) -> web.Response:
 
     reg.remove(did)
 
-    hub = request.app.get("event_hub")
+    hub = request.app.get("hub")
     if hub:
         hub.forget_device(did)
 

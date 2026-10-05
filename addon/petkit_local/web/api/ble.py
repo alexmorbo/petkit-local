@@ -493,13 +493,33 @@ async def api_ble_poll(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "via": parent.petkit_id})
 
 
+async def _unpublish_ble_note(publisher: Any, dev: Any, did: int) -> str:
+    """Remove an unpaired accessory from HA, and say which of the outcomes happened."""
+    reached = None
+    if publisher is not None:
+        try:
+            reached = await publisher.unpublish_ble(dev)
+        except Exception:
+            log.warning("Removing BLE %d from Home Assistant failed", did, exc_info=True)
+            return "Removing it from Home Assistant failed; delete the device there by hand."
+    if reached is None:  # no publisher, or no HA broker configured
+        return "Home Assistant publishing is off, so there was nothing to remove there."
+    if reached:
+        return "Removed from Home Assistant too."
+    return ("Home Assistant is not connected right now; the accessory is removed there "
+            "as soon as it reconnects.")
+
+
 async def api_ble_delete(request: web.Request) -> web.Response:
     """Unpair an accessory.
 
     The parent simply stops being told to scan for it on its next
-    `dev_ble_device`; there is no revoke command. Its Home Assistant entities
-    are left behind — nothing here publishes an empty discovery payload — so
-    the answer says so rather than letting the user think HA has been tidied.
+    `dev_ble_device`; there is no revoke command. Its Home Assistant device is
+    removed: an empty retained payload on every discovery config topic
+    (`get_ble_entities` for its type, the same list it was published from),
+    plus its state and availability. Best effort -- it never fails the unpair;
+    with HA's broker down it is queued and done on reconnect, and the `note`
+    says which of these happened.
     """
     ble = request.app["ble_registry"]
     if ble is None:
@@ -517,8 +537,9 @@ async def api_ble_delete(request: web.Request) -> web.Response:
         # shorter, and until it refetches it keeps scanning for a MAC we have
         # stopped serving.
         await _nudge_relay_list(request, parent_id)
+    note = await _unpublish_ble_note(request.app.get("ha_publisher"), dev, did)
     return web.json_response({
         "ok": True,
         "accessories": [_ble_view(d, request.app["registry"]) for d in ble.all()],
-        "note": "Home Assistant keeps the entities until you delete the device there.",
+        "note": note,
     })

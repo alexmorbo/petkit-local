@@ -1819,3 +1819,33 @@ async def test_an_impossible_offset_is_refused():
         assert "timezone" not in reg.get(1).config
     finally:
         await c.close()
+
+
+async def test_deleting_a_device_unpublishes_it_from_ha():
+    """The handler read `publisher`/`event_hub`, keys nothing sets; the panel's
+    are `ha_publisher`/`hub` (web/appkeys.py). So a deleted device stayed in HA."""
+    class Recorder:
+        def __init__(self):
+            self.unpublished = []
+
+        async def unpublish_discovery(self, device):
+            self.unpublished.append(device.petkit_id)
+            return True
+
+    reg = DeviceRegistry()
+    reg.get_or_create(petkit_id=42, device_type="t5", serial_number="SN42")
+    hub = EventHub()
+    pub = Recorder()
+    cfg = {"api_url": "http://x/6/", "capture": False, "capture_dir": "/nope"}
+    app = create_panel_app(reg, BLERegistry(), hub, cfg, None, ha_publisher=pub)
+    hub._diag[42] = {"http_count": 1, "mqtt_count": 0}
+    c = await _mk_client(app)
+    try:
+        r = await c.delete("/api/devices/42")
+        assert r.status == 200
+        assert (await r.json())["removed"] == 42
+        assert pub.unpublished == [42]
+        assert reg.get(42) is None
+        assert hub.diag(42) == {}
+    finally:
+        await c.close()

@@ -20,10 +20,14 @@ from aiohttp.test_utils import TestClient, TestServer
 from petkit_local.devices import payloads
 from petkit_local.devices.ble import BLERegistry, normalize_mac
 from petkit_local.devices.registry import DeviceRegistry
+from petkit_local.ha.discovery import discovery_topic
+from petkit_local.ha.entities.ble import get_ble_entities
+from petkit_local.ha.publisher import HAPublisher
 from petkit_local.http.server import create_app
 from petkit_local.mqtt.bridge import MQTTBridge
 from petkit_local.web.hub import EventHub
 from petkit_local.web.panel import create_panel_app
+from tests._fakes import FakeMqttClient
 
 HDR = {"X-Device": "id=10&sn=SN10"}
 DEVICE_CONFIG = {"api_url": "http://x/6/", "mqtt_port": 1883, "proxy_mode": False,
@@ -155,7 +159,7 @@ async def test_bad_input_is_refused_with_a_reason(over, status):
         await c.close()
 
 
-async def test_unpairing_removes_it_and_says_what_it_did_not_do():
+async def test_unpairing_removes_it():
     reg = DeviceRegistry()
     reg.get_or_create(petkit_id=10, device_type="t5", serial_number="SN10")
     app, reg, ble = _panel(reg=reg)
@@ -165,9 +169,141 @@ async def test_unpairing_removes_it_and_says_what_it_did_not_do():
         body = await (await c.delete("/api/ble/700")).json()
         assert body["ok"] is True and body["accessories"] == []
         assert ble.get(700) is None
-        # HA keeps the entities — nothing publishes an empty discovery payload.
+        # No HA publisher here (--no-ha): the note says there was nothing to do.
         assert "Home Assistant" in body["note"]
         assert (await c.delete("/api/ble/700")).status == 404
+    finally:
+        await c.close()
+
+
+def _ble_clear_topics(petkit_id, ble_type):
+    return {discovery_topic(e, petkit_id) for e in get_ble_entities(ble_type)} | {
+        f"petkit-local/{petkit_id}/state", f"petkit-local/{petkit_id}/availability"}
+
+
+def _panel_with_publisher(connected=True):
+    reg = DeviceRegistry()
+    reg.get_or_create(petkit_id=10, device_type="t5", serial_number="SN10")
+    ble = BLERegistry()
+    pub = HAPublisher(reg, {}, ble_registry=ble)
+    pub._client = FakeMqttClient()
+    pub._connected = connected
+    cfg = {"api_url": "http://x/6/", "capture": False, "capture_dir": "/nope"}
+    app = create_panel_app(reg, ble, EventHub(), cfg, None, ha_publisher=pub)
+    return app, ble, pub
+
+
+async def test_unpairing_clears_it_from_home_assistant():
+    app, ble, pub = _panel_with_publisher()
+    c = await _client(app)
+    try:
+        await _pair(c)
+        await pub.publish_ble_discovery(ble.get(700))
+        assert 700 in pub._commands._entity_index
+        announced = {t for t, p, _ in pub._client.published if t.endswith("/config") and p}
+        pub._client.published.clear()
+
+        body = await (await c.delete("/api/ble/700")).json()
+        assert body["ok"] is True
+        assert body["note"] == "Removed from Home Assistant too."
+
+        sent = pub._client.published
+        topics = {t for t, _, _ in sent}
+        assert topics == _ble_clear_topics(700, "w5")
+        assert {t for t in topics if t.endswith("/config")} == announced
+        assert "homeassistant/switch/petkit_700_w5_power/config" in topics
+        assert all(p == "" and kw == {"retain": True} for _, p, kw in sent)
+        assert 700 not in pub._commands._entity_index
+        assert pub._pending_clears == {}
+    finally:
+        await c.close()
+
+
+async def test_unpairing_while_ha_is_down_queues_the_cleanup():
+    app, ble, pub = _panel_with_publisher(connected=False)
+    c = await _client(app)
+    try:
+        await _pair(c)
+        r = await c.delete("/api/ble/700")
+        assert r.status == 200
+        body = await r.json()
+        assert "reconnects" in body["note"]
+        assert ("ble", 700) in pub._pending_clears
+        assert pub._client.published == []
+
+        # Reconnect: the tombstone goes out, and the registry no longer has it.
+        pub._connected = True
+        await pub._flush_pending_clears()
+        await pub._publish_all_discovery()
+        sent = pub._client.published
+        assert _ble_clear_topics(700, "w5") <= {t for t, p, _ in sent if p == ""}
+        assert not [t for t, p, _ in sent if "petkit_700_" in t and p != ""]
+        assert not [t for t, p, _ in sent if t.startswith("petkit-local/700/") and p != ""]
+    finally:
+        await c.close()
+
+
+async def test_repairing_a_ble_id_cancels_its_tombstone():
+    app, ble, pub = _panel_with_publisher(connected=False)
+    c = await _client(app)
+    try:
+        await _pair(c)
+        await c.delete("/api/ble/700")
+        assert ("ble", 700) in pub._pending_clears
+        await _pair(c)  # the same accessory again, still offline
+        await pub.publish_ble_discovery(ble.get(700))
+        assert pub._pending_clears == {}
+    finally:
+        await c.close()
+
+
+async def test_repairing_an_id_as_another_type_still_clears_the_old_entities():
+    app, ble, pub = _panel_with_publisher(connected=False)
+    c = await _client(app)
+    try:
+        await _pair(c)
+        await c.delete("/api/ble/700")
+        await _pair(c, ble_type="k3")
+        await pub.publish_ble_discovery(ble.get(700))
+        left = set(pub._pending_clears[("ble", 700)])
+        # Only the W5 configs the K3 does not reuse stay queued.
+        assert left == {discovery_topic(e, 700) for e in get_ble_entities("w5")}
+    finally:
+        await c.close()
+
+
+async def test_unpairing_without_a_configured_broker_queues_nothing():
+    reg = DeviceRegistry()
+    reg.get_or_create(petkit_id=10, device_type="t5", serial_number="SN10")
+    ble = BLERegistry()
+    pub = HAPublisher(reg, {"ha_mqtt_host": ""}, ble_registry=ble)
+    cfg = {"api_url": "http://x/6/", "capture": False, "capture_dir": "/nope"}
+    app = create_panel_app(reg, ble, EventHub(), cfg, None, ha_publisher=pub)
+    c = await _client(app)
+    try:
+        await _pair(c)
+        body = await (await c.delete("/api/ble/700")).json()
+        assert body["note"] == ("Home Assistant publishing is off, so there was nothing "
+                                "to remove there.")
+        assert pub._pending_clears == {}
+    finally:
+        await c.close()
+
+
+async def test_unpairing_survives_a_failing_ha_cleanup():
+    app, ble, pub = _panel_with_publisher()
+
+    async def boom(dev):
+        raise RuntimeError("broker on fire")
+
+    pub.unpublish_ble = boom
+    c = await _client(app)
+    try:
+        await _pair(c)
+        r = await c.delete("/api/ble/700")
+        assert r.status == 200
+        assert "by hand" in (await r.json())["note"]
+        assert ble.get(700) is None
     finally:
         await c.close()
 

@@ -133,3 +133,54 @@ def test_a_plain_http_page_is_told_it_needs_https_not_a_different_browser(tmp_pa
     )
     r = subprocess.run(["node", str(harness)], capture_output=True, text=True, timeout=60)
     assert "PROVISION_OK" in r.stdout, r.stderr.strip()[:2000]
+
+
+PETS_JS = JS_DIR / "pets.js"
+
+PETS_ASSERTIONS = r"""
+const fail = (m, x) => { throw new Error(m + (x === undefined ? '' : ': ' + x)); };
+const ai = [{id: 10, name: 'T5'}, {id: 11, name: 'T6'}];
+const ds = ai;
+
+const one = petCard({id: 1, name: 'Mia', device_ids_json: '[10]', faces: []}, ds, [10], ai);
+if (!one.includes('data-action="pet-remove-device"')) fail('no remove control', one);
+if (!one.includes('data-device="10"')) fail('remove names the wrong device', one);
+if (!one.includes('<option value="11"')) fail('the other AI device is not offered', one);
+if (one.includes('<option value="10"')) fail('offers a device the pet is already on', one);
+if (!one.includes('data-action="pet-add-device"')) fail('no add button', one);
+
+const both = petCard({id: 1, name: 'Mia', device_ids_json: '[10,11]', faces: []}, ds, [10, 11], ai);
+if (both.includes('data-role="pet-add-device"')) fail('add offered with nothing left to add', both);
+if ((both.match(/data-action="pet-remove-device"/g) || []).length !== 2) fail('one × per chip', both);
+
+const none = petCard({id: 1, name: 'Mia', device_ids_json: 'garbage', faces: []}, ds, [10], ai);
+if (!none.includes('no devices assigned')) fail('an unreadable list is not "no devices"', none);
+if (petDeviceIds({device_ids_json: '[10,"11"]'}).join() !== '10,11') fail('ids are numbers');
+if (addableDevices({device_ids_json: '[10]'}, ai).map(d => d.id).join() !== '11') fail('addable');
+
+if (!sameNamePet([{id: 3, name: ' Mia '}], 'mia')) fail('names compare trimmed, any case');
+if (sameNamePet([{id: 3, name: 'Mia'}], 'Mia Two')) fail('a different name matched');
+if (sameNamePet([{id: 3, name: 'Mia'}], '   ')) fail('a blank name matched');
+
+if (weightConflictCard([]) !== '') fail('no conflicts, no card');
+const tie = weightConflictCard([{pet_ids: [1, 2], names: ['<b>x</b>', 'Mia'], weights: [4570, 4570], diff_g: 0}]);
+if (tie.includes('<b><b>x</b>')) fail('a pet name is not escaped', tie);
+if (!tie.includes('&lt;b&gt;x') || !/is a tie/.test(tie)) fail('the tie is not named', tie);
+const near = weightConflictCard([{pet_ids: [1, 2], names: ['Mia', 'Gami'], weights: [4570, 4620], diff_g: 50}]);
+if (!near.includes('50 g apart') || !near.includes('Gami')) fail('the gap is not stated', near);
+console.log('PETS_OK');
+"""
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_a_pet_card_offers_its_devices(tmp_path):
+    """Add/remove a pet's devices from its card, and the duplicate/weight helpers."""
+    harness = tmp_path / "pets.mjs"
+    harness.write_text(
+        DOM_STUB
+        + "const {petCard, petDeviceIds, addableDevices, sameNamePet, weightConflictCard} = "
+        + f"await import({PETS_JS.as_uri()!r});\n"
+        + PETS_ASSERTIONS
+    )
+    r = subprocess.run(["node", str(harness)], capture_output=True, text=True, timeout=60)
+    assert "PETS_OK" in r.stdout, r.stderr.strip()[:2000]

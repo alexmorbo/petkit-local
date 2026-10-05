@@ -23,6 +23,85 @@ async function setAiEnabled(id, on) {
 // events/store.py::MAX_FACES_PER_PET, and a test asserts the two agree.
 const MAX_FACES = 6;
 
+// The pets the tab last loaded. addPet reads it to offer "add this device to
+// the existing pet" before creating a second one of the same name; the server
+// refuses that too (409), this is only what lets the panel ask first.
+let currentPets = [];
+
+// What a pet's membership change tells the user: nothing is pushed to the box,
+// it reads the list itself (`dev_discern_pic`, served live from the database).
+const PICKUP =
+  'the device picks it up at its next check (boot or about hourly; a reboot forces it)';
+
+function petDeviceIds(p) {
+  try {
+    const v = JSON.parse((p && p.device_ids_json) || '[]');
+    return Array.isArray(v) ? v.map(Number) : [];
+  } catch (e) {
+    /* a pet linked to nothing reads better than a broken card */
+    return [];
+  }
+}
+
+// Same eligibility as the add-pet select: the AI-capable devices
+// (`supports_ai`), minus the ones the pet is already on.
+function addableDevices(p, aiDevices) {
+  const on = petDeviceIds(p);
+  return (aiDevices || []).filter(d => !on.includes(Number(d.id)));
+}
+
+// Trimmed and case-insensitive, like the server's guard. JS toLowerCase and
+// Python casefold differ only on exotic letters; the 409 is the backstop.
+function sameNamePet(pets, name) {
+  const n = String(name || '')
+    .trim()
+    .toLowerCase();
+  if (!n) return null;
+  return (
+    (pets || []).find(
+      p =>
+        String(p.name || '')
+          .trim()
+          .toLowerCase() === n,
+    ) || null
+  );
+}
+
+// Two reference weights within 100 g (WEIGHT_CONFLICT_G in ai/pets.py) make
+// weight attribution flip between them, and an exact tie goes to nobody. Every
+// pair counts, not only pets sharing a device: attribution matches a visit
+// against every reference. A warning; the weights are saved either way.
+function weightConflictCard(conflicts) {
+  if (!conflicts || !conflicts.length) return '';
+  const line = c => {
+    const [a, b] = (c.names || []).map(n => esc(n));
+    const [wa, wb] = (c.weights || []).map(w => esc(Math.round(w)));
+    return c.diff_g === 0
+      ? `<li><b>${a}</b> and <b>${b}</b> share a reference weight (${wa} g). A visit between them is a tie and goes to nobody.</li>`
+      : `<li><b>${a}</b> (${wa} g) and <b>${b}</b> (${wb} g) are only ${esc(c.diff_g)} g apart — a visit's weight varies by about that much, so visits will land on the wrong one.</li>`;
+  };
+  return `<div class="card notice">
+    <h3>Reference weights too close</h3>
+    <ul class="sub">${conflicts.map(line).join('')}</ul>
+    <p class="sub" style="margin:0">Give each a distinct weight. If they are the same cat, delete one and add its device to the other — one pet can be on several devices.</p>
+  </div>`;
+}
+
+// The names of the OTHER pets a save's `weight_conflicts` pair this one with.
+function conflictNames(conflicts, petId) {
+  return (conflicts || [])
+    .map(c => {
+      const i = (c.pet_ids || []).map(Number).indexOf(Number(petId));
+      return i < 0 ? null : (c.names || [])[1 - i];
+    })
+    .filter(Boolean);
+}
+
+function conflictSuffix(conflicts, petId) {
+  const names = conflictNames(conflicts, petId);
+  return names.length ? ` · reference weight is close to ${names.join(', ')}` : '';
+}
+
 // ---- the tab ---------------------------------------------------------------
 async function loadPets() {
   const v = document.getElementById('petsView');
@@ -33,6 +112,7 @@ async function loadPets() {
     api('info').catch(() => ({})),
   ]);
   const pets = pd.pets || [];
+  currentPets = pets;
   const unbound = ub.unbound || [];
   const aiDevices = ds.filter(d => d.supports_ai);
   // Full detail per AI device: the summary in /api/devices carries no entities
@@ -60,6 +140,7 @@ async function loadPets() {
     ${aiDetails.map(d => deviceAiCard(d, ourFaceIds)).join('')}
     ${aiDevices.length ? '' : noAiDeviceCard(info.ai_device_names || [])}
     ${aiDevices.length && !recognising ? recognitionOffCard() : ''}
+    ${recognising ? weightConflictCard(pd.weight_conflicts || []) : ''}
     ${recognising ? petsSection(pets, ds, aiDevices, recognisingIds) : ''}
     ${aiDevices.length ? importPetsCard(aiDevices) : ''}
     ${recognising && unbound.length ? unboundCard(unbound, pets) : ''}`;
@@ -97,19 +178,21 @@ function petsSection(pets, ds, aiDevices, recognisingIds) {
       </div>
       <p class="sub" style="margin-top:8px">
         Give each cat up to ${MAX_FACES} mugshots. The device downloads them and matches
-        against them itself — more angles, better recognition.
+        against them itself — more angles, better recognition. <b>Add each pet once:</b>
+        a pet can be on several devices, so to have another box recognise it use
+        <b>Add device</b> on its card rather than adding the pet again.
       </p>
       <div class="newpet">
         <input id="newPetName" placeholder="Name" aria-label="Pet name">
         <input id="newPetWeight" type="number" min="0" step="1" placeholder="Weight, g"
                aria-label="Reference weight in grams (optional)">
-        <select id="newPetDevice" aria-label="Assign to device">${aiDevices
+        <select id="newPetDevice" aria-label="First device for this pet">${aiDevices
           .map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`)
           .join('')}</select>
         <button class="act" data-action="add-pet">Add pet</button>
       </div>
     </div>
-    ${pets.length ? pets.map(p => petCard(p, ds, recognisingIds)).join('') : emptyPets()}`;
+    ${pets.length ? pets.map(p => petCard(p, ds, recognisingIds, aiDevices)).join('') : emptyPets()}`;
 }
 
 // Recognition is off everywhere. The pets are still stored — this only hides a
@@ -167,13 +250,8 @@ function emptyPets() {
   </div>`;
 }
 
-function petCard(p, ds, recognisingIds) {
-  let devIds = [];
-  try {
-    devIds = JSON.parse(p.device_ids_json || '[]');
-  } catch (e) {
-    /* a pet linked to nothing reads better than a broken card */
-  }
+function petCard(p, ds, recognisingIds, aiDevices) {
+  const devIds = petDeviceIds(p);
   // A chip per device this pet is assigned to, dimmed when that particular box
   // is not recognising — the assignment is still real, it is just not doing
   // anything there. Without this a pet on two devices looks equally active on
@@ -183,11 +261,22 @@ function petCard(p, ds, recognisingIds) {
     .map(id => {
       const d = ds.find(x => x.id === id);
       const name = esc(d ? d.name : '#' + id);
+      const x = `<button class="chip-x" title="Remove from this device" aria-label="Remove from ${name}"
+        data-action="pet-remove-device" data-id="${esc(p.id)}" data-device="${esc(id)}"
+        data-name="${name}">×</button>`;
       return off(id)
-        ? `<span class="badge off" title="Recognition is off on this device">${name} · off</span>`
-        : `<span class="badge">${name}</span>`;
+        ? `<span class="badge off" title="Recognition is off on this device">${name} · off${x}</span>`
+        : `<span class="badge">${name}${x}</span>`;
     })
     .join(' ');
+  // Offered only what the add-pet select would offer, minus where it already is.
+  const addable = addableDevices(p, aiDevices);
+  const add = addable.length
+    ? `<select class="pet-add-dev" data-role="pet-add-device" aria-label="Add a device">${addable
+        .map(d => `<option value="${esc(d.id)}">${esc(d.name || '#' + d.id)}</option>`)
+        .join('')}</select>
+       <button class="mini" data-action="pet-add-device" data-id="${esc(p.id)}">Add device</button>`
+    : '';
   const faces = p.faces || [];
   const full = faces.length >= MAX_FACES;
 
@@ -199,7 +288,7 @@ function petCard(p, ds, recognisingIds) {
             data-weight="${esc(p.weight ?? '')}"
             title="Reference weight in grams. Litter-box visits that report no identity go to the pet whose reference is nearest."
             >${p.weight ? esc(Math.round(p.weight)) + ' g' : 'set weight'}</span>
-      <span class="pet-devs">${chips || '<span class="mut">no devices assigned</span>'}</span>
+      <span class="pet-devs">${chips || '<span class="mut">no devices assigned</span>'}${add}</span>
       <button class="ghost act" data-action="delete-pet" data-id="${esc(p.id)}">Delete</button>
     </div>
     <div class="tiles">
@@ -329,7 +418,11 @@ onAction('edit-pet-weight', el => {
     });
     if (r.error) return toast('Error: ' + r.error);
     const n = r.reattributed || 0;
-    toast('Saved' + (n ? ` · ${n} visit${n === 1 ? '' : 's'} re-attributed` : ''));
+    toast(
+      'Saved' +
+        (n ? ` · ${n} visit${n === 1 ? '' : 's'} re-attributed` : '') +
+        conflictSuffix(r.weight_conflicts, id),
+    );
     loadPets();
   };
 
@@ -344,6 +437,43 @@ onAction('edit-pet-weight', el => {
 });
 
 onAction('add-pet', () => addPet());
+
+// Membership is a fresh read-modify-write, like bindPetRef: a stale tab must
+// not drop a device added from another one.
+async function setPetDevices(petId, mutate) {
+  const cur = (await api('pets/' + encodeURIComponent(petId))).pet;
+  if (!cur) return { error: 'pet not found' };
+  const ids = mutate(petDeviceIds(cur));
+  return api('pets/' + encodeURIComponent(petId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_ids: ids }),
+  });
+}
+
+onAction('pet-add-device', async el => {
+  const sel = el.closest('.petcard').querySelector('[data-role=pet-add-device]');
+  const did = Number(sel && sel.value);
+  if (!did) return;
+  const r = await setPetDevices(el.dataset.id, ids => (ids.includes(did) ? ids : [...ids, did]));
+  toast(r.error ? 'Error: ' + r.error : 'Added — ' + PICKUP);
+  loadPets();
+});
+
+onAction('pet-remove-device', async el => {
+  const did = Number(el.dataset.device);
+  const card = el.closest('.petcard');
+  const last = card.querySelectorAll('[data-action=pet-remove-device]').length <= 1;
+  const ok = confirm(
+    last
+      ? `Remove ${el.dataset.name}? This pet will then be on no device, so no box recognises it by face (weight matching still works).`
+      : `Stop serving this pet's mugshots to ${el.dataset.name}?`,
+  );
+  if (!ok) return;
+  const r = await setPetDevices(el.dataset.id, ids => ids.filter(x => x !== did));
+  toast(r.error ? 'Error: ' + r.error : 'Removed — ' + PICKUP);
+  loadPets();
+});
 onAction('delete-pet', el => deletePet(el.dataset.id));
 onAction('delete-face', el => deleteFace(el.dataset.id, el.dataset.face));
 
@@ -382,18 +512,67 @@ async function addPet() {
   const name = document.getElementById('newPetName').value.trim();
   if (!name) return toast('Name required');
   const devSel = document.getElementById('newPetDevice');
-  const device_ids = devSel.value ? [Number(devSel.value)] : [];
+  const did = devSel.value ? Number(devSel.value) : null;
+  const device_ids = did !== null ? [did] : [];
+  const devName =
+    devSel.selectedOptions && devSel.selectedOptions[0]
+      ? devSel.selectedOptions[0].textContent
+      : 'this device';
   const weightRaw = document.getElementById('newPetWeight').value.trim();
   const weight = weightRaw === '' ? null : Number(weightRaw);
+
+  // A second pet of the same name is almost always the same cat added for a
+  // second box — and two pets with the same weight tie every visit, so weight
+  // attribution then names neither. Offer the right thing first.
+  const existing = sameNamePet(currentPets, name);
+  let allow_duplicate = false;
+  if (existing) {
+    const already = did !== null && petDeviceIds(existing).includes(did);
+    if (
+      !already &&
+      did !== null &&
+      confirm(
+        `${existing.name} already exists. Add ${devName} to the existing ${existing.name} instead?\n\n` +
+          'One pet can be on several devices. A second pet with the same name and weight ties every visit.',
+      )
+    ) {
+      const r = await setPetDevices(existing.id, ids => (ids.includes(did) ? ids : [...ids, did]));
+      // Only the device is added: a weight typed into the add form would
+      // silently move the existing pet's reference, so it is not applied.
+      const keptWeight =
+        weight !== null &&
+        Number.isFinite(weight) &&
+        weight > 0 &&
+        Math.round(weight) !== Math.round(Number(existing.weight) || 0)
+          ? ` · the ${Math.round(weight)} g you typed was not applied; ${existing.name} keeps ` +
+            (existing.weight ? `${Math.round(existing.weight)} g` : 'no reference weight') +
+            ' (edit it on the card)'
+          : '';
+      toast(
+        r.error
+          ? 'Error: ' + r.error
+          : `Added ${devName} to ${existing.name} — ` + PICKUP + keptWeight,
+      );
+      return loadPets();
+    }
+    const again = already
+      ? `${existing.name} is already on ${devName}. Create a second, separate pet with the same name anyway?`
+      : `Create a second, separate pet also called ${name}?`;
+    if (!confirm(again)) return;
+    allow_duplicate = true;
+  }
+
   const r = await api('pets', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name, device_ids: device_ids, weight: weight }),
+    body: JSON.stringify({ name, device_ids, weight, allow_duplicate }),
   });
   const n = r.reattributed || 0;
   toast(
     r.pet
-      ? 'Pet added' + (n ? ` · ${n} visit${n === 1 ? '' : 's'} attributed by weight` : '')
+      ? 'Pet added' +
+          (n ? ` · ${n} visit${n === 1 ? '' : 's'} attributed by weight` : '') +
+          conflictSuffix(r.weight_conflicts, r.pet.id)
       : 'Error: ' + (r.error || 'failed'),
   );
   loadPets();
@@ -439,4 +618,4 @@ async function bindPetRef(ref, petId) {
   loadPets();
 }
 
-export { loadPets };
+export { loadPets, petCard, petDeviceIds, addableDevices, sameNamePet, weightConflictCard };

@@ -28,6 +28,11 @@ class FakeHAPublisher:
         self.states = []
         self.pet_discoveries = []
         self.pet_states = []
+        self.pet_unpublished = []
+
+    async def unpublish_pet(self, pet_id):
+        self.pet_unpublished.append(pet_id)
+        return True
 
     async def publish_state(self, device):
         self.states.append(device.petkit_id)
@@ -448,6 +453,72 @@ async def test_pets_crud_via_api():
             r4 = await c.delete(f"/api/pets/{pet['id']}")
             assert (await r4.json())["ok"] is True
             assert (await (await c.get("/api/pets")).json())["pets"] == []
+            assert ha_publisher.pet_unpublished == [pet["id"]]
+        finally:
+            await c.close()
+
+
+async def test_adding_and_removing_a_device_on_a_pet():
+    with tempfile.TemporaryDirectory() as tmp:
+        app, reg, device, store, retention, pet_registry, ha_publisher, media_root = _panel(tmp)
+        c = await _client(app)
+        try:
+            pet = (await (await c.post("/api/pets", json={"name": "Mia", "device_ids": [1]}))
+                   .json())["pet"]
+            await pet_registry.add_face(pet["id"], JPEG_BYTES)
+            pid = pet["id"]
+
+            def served(payload):
+                return [e["id"] for e in payload["result"]["list"]]
+
+            assert served(await pet_registry.discern_pic_payload(2, "h")) == []
+
+            r = await c.post(f"/api/pets/{pid}", json={"device_ids": [1, 2, 2]})
+            assert r.status == 200
+            assert (await r.json())["pet"]["device_ids_json"] == "[1, 2]"
+            # Served on device 2's next dev_discern_pic, with nothing pushed.
+            assert served(await pet_registry.discern_pic_payload(2, "h")) == [pid]
+            assert served(await pet_registry.discern_pic_payload(1, "h")) == [pid]
+
+            r = await c.post(f"/api/pets/{pid}", json={"device_ids": [1]})
+            assert served(await pet_registry.discern_pic_payload(2, "h")) == []
+
+            # The last device can go too: the pet just stops being recognised.
+            r = await c.post(f"/api/pets/{pid}", json={"device_ids": []})
+            assert r.status == 200
+            assert (await r.json())["pet"]["device_ids_json"] == "[]"
+            assert served(await pet_registry.discern_pic_payload(1, "h")) == []
+
+            # The pet's HA device is republished, never removed, by a change.
+            assert ha_publisher.pet_discoveries.count(pid) == 4
+            assert ha_publisher.pet_unpublished == []
+        finally:
+            await c.close()
+
+
+async def test_creating_a_duplicate_name_is_refused_with_the_existing_id():
+    with tempfile.TemporaryDirectory() as tmp:
+        app, reg, device, store, retention, pet_registry, ha_publisher, media_root = _panel(tmp)
+        c = await _client(app)
+        try:
+            mia = (await (await c.post("/api/pets", json={"name": "Mia", "device_ids": [1]}))
+                   .json())["pet"]
+
+            r = await c.post("/api/pets", json={"name": "  mIA ", "device_ids": [2]})
+            assert r.status == 409
+            body = await r.json()
+            assert body["existing_id"] == mia["id"]
+            assert body["error"] == ("A pet called Mia already exists — add this device "
+                                     "to it from its card instead")
+            assert len(await pet_registry.all()) == 1
+
+            r = await c.post("/api/pets", json={"name": "Mia", "device_ids": [2],
+                                                "allow_duplicate": True})
+            assert r.status == 200
+            assert len(await pet_registry.all()) == 2
+
+            r = await c.post("/api/pets", json={"name": "Mia Two"})
+            assert r.status == 200
         finally:
             await c.close()
 

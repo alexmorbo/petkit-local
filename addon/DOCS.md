@@ -169,6 +169,18 @@ the pet's name (or "set weight") and enter it in grams.
 The pet's **Weight** sensor is the median of its last seven weighed visits. It
 never changes the reference, so a wrong match cannot drift it.
 
+- **Add each pet once.** One pet can be on several devices: use **Add device**
+  on its card (or the × on a device chip to take it off) rather than adding the
+  pet again. Adding a pet under a name that already exists offers to add the
+  device to the existing pet instead. A device picks up the change at its next
+  check — boot, or about hourly; a reboot forces it.
+- Two reference weights **within 100 g** get a warning card in the Pets tab:
+  visits between them land on the wrong pet, and an exact tie goes to nobody.
+  Saving is not blocked.
+- **Deleting a pet removes its Home Assistant device** (and unpairing a BLE
+  accessory or deleting a device removes theirs). If HA's broker is down at the
+  time, it happens when the add-on reconnects to it.
+
 ## Provisioning over Bluetooth
 
 The **Provision** tab hands a device its Wi-Fi credentials, a custom `apiServers`

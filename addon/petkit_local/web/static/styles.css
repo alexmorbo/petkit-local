@@ -890,6 +890,24 @@ a:hover {
   display: flex;
   gap: 5px;
   flex-wrap: wrap;
+  align-items: center;
+}
+/* The × on a pet's device chip: removes the pet from that device. Inherits the
+   chip's colour so a dimmed "off" chip has a dimmed control too. */
+.badge .chip-x {
+  border: 0;
+  background: none;
+  padding: 0 0 0 4px;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.6;
+  font: inherit;
+}
+.badge .chip-x:hover {
+  opacity: 1;
+}
+.pet-add-dev {
+  font-size: 12px;
 }
 .pet-foot {
   font-size: 12px;

@@ -16,8 +16,9 @@ from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from petkit_local.ai.pets import (WEIGHT_OUTLIER_GUARD_G, PetRegistry, nearest_pet_by_weight,
-                                  plan_weight_reattribution)
+from petkit_local.ai.pets import (WEIGHT_CONFLICT_G, WEIGHT_OUTLIER_GUARD_G, PetRegistry,
+                                  nearest_pet_by_weight, plan_weight_reattribution,
+                                  weight_conflicts)
 from petkit_local.devices.registry import DeviceRegistry
 from petkit_local.events.migrations import backfill_event_rows
 from petkit_local.events.store import EventStore
@@ -33,6 +34,11 @@ class FakePublisher:
     def __init__(self):
         self.pet_discoveries = []
         self.pet_states = []
+        self.pet_unpublished = []
+
+    async def unpublish_pet(self, pet_id):
+        self.pet_unpublished.append(pet_id)
+        return True
 
     async def publish_event(self, device, suffix, event_type, attrs=None):
         pass
@@ -94,6 +100,23 @@ def test_a_missing_or_non_positive_weight_is_never_attributed():
     refs = {2: 5075.0}
     for weight in (None, 0, -5):
         assert nearest_pet_by_weight(weight, refs) is None
+
+
+def test_weight_conflicts_finds_equal_references():
+    assert weight_conflicts({1: 4570.0, 2: 4570.0}) == [(1, 2, 0.0)]
+
+
+def test_weight_conflicts_is_inclusive_at_100_g_and_quiet_beyond():
+    assert WEIGHT_CONFLICT_G == 100.0
+    assert weight_conflicts({1: 4500.0, 2: 4600.0}) == [(1, 2, 100.0)]
+    assert weight_conflicts({1: 4500.0, 2: 4601.0}) == []
+
+
+def test_weight_conflicts_reports_every_pair_sorted():
+    assert weight_conflicts({3: 4560.0, 1: 4500.0, 2: 4530.0}) == [
+        (1, 2, 30.0), (1, 3, 60.0), (2, 3, 30.0)]
+    assert weight_conflicts({}) == []
+    assert weight_conflicts({1: 4500.0}) == []
 
 
 def test_planning_skips_pet_in_and_is_idempotent():
@@ -444,3 +467,105 @@ def test_the_panel_can_edit_a_reference_weight():
     assert "onAction('edit-pet-weight'" in js
     assert "JSON.stringify({ weight })" in js
     assert "newPetWeight" in js
+
+
+def test_the_panel_shows_weight_conflicts():
+    js = PETS_JS.read_text()
+    assert "weight_conflicts" in js
+    assert "function weightConflictCard" in js
+
+
+async def test_the_pets_list_names_weight_conflicts(event_store, pet_registry):
+    mia = await pet_registry.create("Mia", weight=4570)
+    gami = await pet_registry.create("Gami", weight=4600)
+    await pet_registry.create("Bars", weight=6000)
+    c = await _panel(event_store, pet_registry)
+    try:
+        body = await (await c.get("/api/pets")).json()
+        assert len(body["pets"]) == 3
+        assert body["weight_conflicts"] == [{
+            "pet_ids": [mia["id"], gami["id"]], "names": ["Mia", "Gami"],
+            "weights": [4570.0, 4600.0], "diff_g": 30,
+        }]
+    finally:
+        await c.close()
+
+
+async def test_a_weight_update_warns_but_saves(event_store, pet_registry):
+    mia = await pet_registry.create("Mia", weight=4570)
+    gami = await pet_registry.create("Gami", weight=5200)
+    c = await _panel(event_store, pet_registry)
+    try:
+        body = await _post(c, f"/api/pets/{gami['id']}", {"weight": 4570})
+        assert body["pet"]["weight"] == 4570.0
+        assert body["weight_conflicts"] == [{
+            "pet_ids": [mia["id"], gami["id"]], "names": ["Mia", "Gami"],
+            "weights": [4570.0, 4570.0], "diff_g": 0,
+        }]
+        body = await _post(c, f"/api/pets/{gami['id']}", {"weight": 5300})
+        assert body["pet"]["weight"] == 5300.0
+        assert body["weight_conflicts"] == []
+        # A POST that does not touch the weight carries no verdict on it.
+        body = await _post(c, f"/api/pets/{gami['id']}", {"name": "Gami II"})
+        assert "weight_conflicts" not in body
+    finally:
+        await c.close()
+
+
+async def test_creating_a_pet_near_another_warns_but_creates(event_store, pet_registry):
+    mia = await pet_registry.create("Mia", weight=4570)
+    await pet_registry.create("Bars", weight=6000)
+    c = await _panel(event_store, pet_registry)
+    try:
+        body = await _post(c, "/api/pets", {"name": "Gami", "weight": 4650})
+        gid = body["pet"]["id"]
+        assert [x["pet_ids"] for x in body["weight_conflicts"]] == [[mia["id"], gid]]
+        assert body["weight_conflicts"][0]["diff_g"] == 80
+    finally:
+        await c.close()
+
+
+async def test_weight_conflicts_ignore_devices(event_store, pet_registry):
+    # Attribution matches a visit against EVERY reference, whichever box the
+    # pet's mugshots are served to -- so two pets on different devices still
+    # steal each other's visits.
+    await pet_registry.create("Mia", device_ids=[1], weight=4570)
+    await pet_registry.create("Mia", device_ids=[2], weight=4570)
+    c = await _panel(event_store, pet_registry)
+    try:
+        body = await (await c.get("/api/pets")).json()
+        assert len(body["weight_conflicts"]) == 1
+        assert body["weight_conflicts"][0]["diff_g"] == 0
+    finally:
+        await c.close()
+
+
+async def test_deleting_a_pet_removes_it_from_home_assistant(event_store, pet_registry):
+    mia = await pet_registry.create("Mia", weight=4570)
+    pub = FakePublisher()
+    c = await _panel(event_store, pet_registry, pub)
+    try:
+        body = await (await c.delete(f"/api/pets/{mia['id']}")).json()
+        assert body == {"ok": True, "reattributed": 0}
+        assert pub.pet_unpublished == [mia["id"]]
+        # A pet that is already gone is not unpublished twice.
+        await c.delete(f"/api/pets/{mia['id']}")
+        assert pub.pet_unpublished == [mia["id"]]
+    finally:
+        await c.close()
+
+
+async def test_a_failing_ha_cleanup_never_fails_the_delete(event_store, pet_registry):
+    class Exploding(FakePublisher):
+        async def unpublish_pet(self, pet_id):
+            raise RuntimeError("broker on fire")
+
+    mia = await pet_registry.create("Mia")
+    c = await _panel(event_store, pet_registry, Exploding())
+    try:
+        r = await c.delete(f"/api/pets/{mia['id']}")
+        assert r.status == 200
+        assert (await r.json())["ok"] is True
+        assert await pet_registry.get(mia["id"]) is None
+    finally:
+        await c.close()

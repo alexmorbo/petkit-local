@@ -21,10 +21,10 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-from petkit_local.ai.pets import cloud_pets
+from petkit_local.ai.pets import cloud_pets, weight_conflicts
 from petkit_local.events.store import MAX_FACES_PER_PET
 from petkit_local.http.cloud_fetch import CLOUD_TIMEOUT, CloudRefused, fetch_as_device
-from petkit_local.utils.coerce import to_int
+from petkit_local.utils.coerce import to_bool, to_int
 from petkit_local.utils.paths import UnsafePathError, safe_join
 from petkit_local.web.api._common import (
     _cloud_upstream, _face_summaries, _json_body, _path_id, _pets_by_id,
@@ -77,30 +77,63 @@ async def _reattribute(request: web.Request) -> int:
     return changed
 
 
+async def _weight_conflicts(pet_registry: Any, pet_id: int | None = None) -> list[dict[str, Any]]:
+    """`weight_conflicts` as the panel shows them, optionally only those naming `pet_id`.
+
+    A warning, never a refusal: the reference is saved either way.
+    """
+    names = {p["id"]: p.get("name") or f"#{p['id']}" for p in await pet_registry.all()}
+    refs = await pet_registry.weight_references()
+    return [{"pet_ids": [a, b], "names": [names.get(a), names.get(b)],
+             "weights": [refs[a], refs[b]], "diff_g": round(d)}
+            for a, b, d in weight_conflicts(refs)
+            if pet_id is None or pet_id in (a, b)]
+
+
 async def api_pets_list_create(request: web.Request) -> web.Response:
     """List the pets, or create one.
 
-    GET answers `{"pets": [...]}`, POST `{"pet": {...}, "reattributed": n}`. A
-    `name` is required; unparseable `device_ids` degrade to "no devices" rather
-    than failing the create, since the link can be fixed afterwards, and an
+    GET answers `{"pets": [...], "weight_conflicts": [...]}`, POST
+    `{"pet": {...}, "reattributed": n, "weight_conflicts": [...]}` -- the
+    conflicts are pairs of references within `WEIGHT_CONFLICT_G` (POST: only
+    those naming the new pet), a warning that never blocks the save. A `name`
+    is required; unparseable `device_ids` degrade to "no devices" rather than
+    failing the create, since the link can be fixed afterwards, and an
     unparseable `weight` to no reference. A new pet is immediately published to
     HA as its own virtual device, and one with a reference weight takes its
     share of the unattributed visits (`ai/pets.py::nearest_pet_by_weight`).
+
+    A name already taken (trimmed, case-insensitive) answers 409 with the
+    `existing_id`, unless `allow_duplicate` is set: one pet can be on several
+    devices, and a second pet of the same name and weight ties every visit.
+    Cloud import calls `PetRegistry.create` directly and bypasses this on
+    purpose -- its names are `PetKit pet <ref>`, unique per ref.
     """
     pet_registry = request.app.get("pet_registry")
     if pet_registry is None:
         return web.json_response({"error": "pet registry not available"}, status=400)
 
     if request.method == "GET":
-        return web.json_response({"pets": list((await _pets_by_id(request)).values())})
+        return web.json_response({
+            "pets": list((await _pets_by_id(request)).values()),
+            "weight_conflicts": await _weight_conflicts(pet_registry),
+        })
 
     body = await _json_body(request)
 
     name = str(body.get("name", "")).strip()
     if not name:
         return web.json_response({"error": "name required"}, status=400)
+    if not to_bool(body.get("allow_duplicate"), False):
+        wanted = name.casefold()
+        for other in await pet_registry.all():
+            if str(other.get("name") or "").strip().casefold() == wanted:
+                return web.json_response(
+                    {"error": f"A pet called {other['name']} already exists — add this "
+                              f"device to it from its card instead",
+                     "existing_id": other["id"]}, status=409)
     try:
-        device_ids = [int(x) for x in (body.get("device_ids") or [])]
+        device_ids = list(dict.fromkeys(int(x) for x in (body.get("device_ids") or [])))
     except (TypeError, ValueError):
         device_ids = []
 
@@ -111,7 +144,9 @@ async def api_pets_list_create(request: web.Request) -> web.Response:
     if ha_publisher is not None:
         await ha_publisher.publish_pet_discovery(pet)
     reattributed = await _reattribute(request) if weight is not None else 0
-    return web.json_response({"pet": pet, "reattributed": reattributed})
+    return web.json_response({"pet": pet, "reattributed": reattributed,
+                              "weight_conflicts": await _weight_conflicts(pet_registry,
+                                                                          pet["id"])})
 
 
 async def api_pet_detail(request: web.Request) -> web.Response:
@@ -122,7 +157,11 @@ async def api_pet_detail(request: web.Request) -> web.Response:
     and a `device_ids` that will not parse is skipped rather than clearing the
     links. Same for `weight` (the reference visits are attributed against):
     garbage is skipped, null/""/0 clears it. A POST or DELETE that can change
-    weight attribution re-runs it over history and adds `reattributed`.
+    weight attribution re-runs it over history and adds `reattributed`; a POST
+    carrying `weight` also adds `weight_conflicts` (a warning, see the list
+    endpoint). DELETE also removes the pet's HA device -- empty retained
+    configs, state and availability, queued for the next connect if HA's broker
+    is down. Best effort: it never fails the delete.
     """
     pet_registry = request.app.get("pet_registry")
     if pet_registry is None:
@@ -131,6 +170,14 @@ async def api_pet_detail(request: web.Request) -> web.Response:
 
     if request.method == "DELETE":
         ok = await pet_registry.delete(pid)
+        ha_publisher = request.app.get("ha_publisher")
+        if ok and ha_publisher is not None:
+            # Before the reattribution, so the republish of the pets it moved
+            # follows the removal rather than racing it.
+            try:
+                await ha_publisher.unpublish_pet(pid)
+            except Exception:
+                log.warning("Removing pet %d from Home Assistant failed", pid, exc_info=True)
         reattributed = await _reattribute(request) if ok else 0
         return web.json_response({"ok": ok, "reattributed": reattributed})
 
@@ -153,7 +200,11 @@ async def api_pet_detail(request: web.Request) -> web.Response:
         fields["name"] = str(body["name"]).strip()
     if "device_ids" in body:
         try:
-            fields["device_ids_json"] = [int(x) for x in body["device_ids"]]
+            # Nothing else to do on a membership change: `discern_pic_payload`
+            # reads this live, so the device gets it at its next
+            # `dev_discern_pic` poll (boot / about hourly), like a new mugshot,
+            # and the pet's HA device does not depend on it.
+            fields["device_ids_json"] = list(dict.fromkeys(int(x) for x in body["device_ids"]))
         except (TypeError, ValueError):
             pass
     if "device_pet_ids" in body:
@@ -220,8 +271,10 @@ async def api_pet_detail(request: web.Request) -> web.Response:
         await ha_publisher.publish_pet_discovery(pet)
         if store is not None:
             await ha_publisher.publish_pet_state(pet, store)
-    return web.json_response({"pet": pet, "bound_events": bound,
-                              "reattributed": reattributed})
+    out: dict[str, Any] = {"pet": pet, "bound_events": bound, "reattributed": reattributed}
+    if "weight" in fields:
+        out["weight_conflicts"] = await _weight_conflicts(pet_registry, pid)
+    return web.json_response(out)
 
 
 async def api_pet_faces(request: web.Request) -> web.Response:

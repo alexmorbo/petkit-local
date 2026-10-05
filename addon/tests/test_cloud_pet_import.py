@@ -325,3 +325,22 @@ async def test_an_imported_pet_can_be_renamed(pet_registry: PetRegistry, event_s
     finally:
         await c.close()
         await up.close()
+
+
+async def test_import_is_not_blocked_by_the_duplicate_guard(
+        pet_registry: PetRegistry, event_store):
+    """The panel's create refuses a taken name (409); import creates through the
+    registry and must not. A pet already called `PetKit pet 500` that does NOT
+    hold the alias is a different pet as far as import can tell."""
+    await pet_registry.create("PetKit pet 500")
+    handler, _ = _cloud_with([1])
+    up, base = await _serve(handler)
+    c = await _panel(pet_registry, event_store, base)
+    try:
+        body = await (await c.post("/api/pets/import",
+                                   data=json.dumps({"device_id": 10}))).json()
+        assert body["results"][0]["outcome"] == "imported"
+        assert len(await pet_registry.all()) == 2
+    finally:
+        await c.close()
+        await up.close()
