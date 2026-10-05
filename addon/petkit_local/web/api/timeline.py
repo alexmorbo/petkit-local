@@ -101,6 +101,8 @@ async def api_timeline(request: web.Request) -> web.Response:
             # when the closing report reached us, several seconds later.
             "display_ts": s.get("display_ts") or s.get("ts"),
             "pet_id": s.get("pet_id"), "event_type": s.get("event_type"),
+            # "weight" when the pet was picked by the scale, not by a face.
+            "pet_source": s.get("pet_source"),
             **_pet_fields(pets, s.get("pet_id")),
             # A visit builds its own summary line (duration/weight); every
             # other card is titled by its event's label, now decoded from the
@@ -180,6 +182,7 @@ async def api_event_detail(request: web.Request) -> web.Response:
             # no id is the signal that the box is still matching against faces
             # cached from PetKit's cloud.
             "pet_ref": row.get("pet_ref"),
+            "pet_source": row.get("pet_source"),
             **_pet_fields(await _pets_by_id(request), row.get("pet_id")),
             "score": row.get("score"),
             "related_event": row.get("related_event"),

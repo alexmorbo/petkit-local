@@ -197,9 +197,10 @@ async def handle_event_report(request: web.Request) -> web.Response:
     # `pet_ref` is what the device claimed; `pet_id` is what we could prove.
     # Resolving BEFORE the insert keeps the row consistent in one write, and
     # leaving `pet_id` None for an unknown id is what stops a stale cloud
-    # identity from fabricating an HA pet device.
+    # identity from fabricating an HA pet device. A visit that claims nobody
+    # may still be attributed by its weight (ai/pets.py::attribute).
     if pet_registry is not None:
-        row["pet_id"] = await pet_registry.resolve_pet_ref(row.get("pet_ref"))
+        await pet_registry.attribute(row)
 
     await store.upsert_event(row)
 

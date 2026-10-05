@@ -8,6 +8,7 @@ async def test_stats_empty_for_pet_with_no_visits(event_store):
         "last_visit_ts": None, "visits_today": 0,
         "last_visit_weight": None, "last_visit_duration": None,
         "last_device_id": None,
+        "weight": None, "last_drink_ts": None, "drinks_today": 0,
     }
 
 
@@ -84,3 +85,65 @@ async def test_stats_ignore_other_pets_and_non_visit_events(event_store):
     stats = await store.pet_visit_stats(1, now=200.0)
     assert stats["last_visit_ts"] is None
     assert stats["visits_today"] == 0
+
+
+async def test_weight_is_the_median_of_the_newest_seven_summaries(event_store):
+    """`pet_in` carries a PARTIAL weight (the cat is still stepping in), so it
+    must never reach the median however recent it is; and only the newest
+    seven summaries count, so an old outlier ages out."""
+    store = event_store
+    weights = [9000, 4000, 4100, 4200, 4300, 4400, 4500, 4600]  # oldest first
+    for i, w in enumerate(weights):
+        await store.upsert_event({"device_id": 5, "device_type": "t6", "event_type": "pet_out",
+                                  "event_kind": "toilet_visit", "pet_id": 1, "ts": 100.0 + i,
+                                  "content_json": f'{{"pet_weight": {w}}}'})
+    await store.upsert_event({"device_id": 5, "device_type": "t6", "event_type": "pet_in",
+                              "event_kind": "toilet_visit", "pet_id": 1, "ts": 500.0,
+                              "content_json": '{"pet_weight": 1}'})
+    stats = await store.pet_visit_stats(1, now=1000.0)
+    # newest seven: 4000..4600 -> median 4300; the 9000 has aged out.
+    assert stats["weight"] == 4300
+    assert isinstance(stats["weight"], int)
+
+
+async def test_weight_is_none_without_weighed_visits(event_store):
+    store = event_store
+    await store.upsert_event({"device_id": 5, "device_type": "t6", "event_type": "pet_out",
+                              "event_kind": "toilet_visit", "pet_id": 1, "ts": 100.0})
+    await store.upsert_event({"device_id": 5, "device_type": "t6", "event_type": "pet_out",
+                              "event_kind": "toilet_visit", "pet_id": 1, "ts": 110.0,
+                              "content_json": '{"pet_weight": 0}'})
+    stats = await store.pet_visit_stats(1, now=1000.0)
+    assert stats["weight"] is None
+
+
+async def test_drinks_today_counts_from_local_midnight(event_store):
+    store = event_store
+    now = 86400.0 * 100 + 43200
+    day_start, _, _ = local_day_bounds(now=now)
+    for ts in (day_start + 10, day_start + 20, day_start - 100):
+        await store.upsert_event({"device_id": 7, "device_type": "w7h",
+                                  "event_type": "drink_over", "event_kind": "drinking",
+                                  "pet_id": 1, "ts": ts})
+    stats = await store.pet_visit_stats(1, now=now)
+    assert stats["drinks_today"] == 2
+    assert stats["last_drink_ts"] == day_start + 20
+
+
+async def test_drinks_ignore_other_pets_unattributed_and_starts(event_store):
+    store = event_store
+    now = 86400.0 * 100 + 43200
+    day_start, _, _ = local_day_bounds(now=now)
+    rows = [
+        ("drink_over", 2, day_start + 10),     # another pet
+        ("drink_over", None, day_start + 20),  # recognised nobody
+        ("drink_start", 1, day_start + 30),    # the start of a drink, not a drink
+        ("6", 1, day_start + 40),              # fountain HTTP "Drinking done"
+    ]
+    for event_type, pet_id, ts in rows:
+        await store.upsert_event({"device_id": 7, "device_type": "w7h",
+                                  "event_type": event_type, "event_kind": "drinking",
+                                  "pet_id": pet_id, "ts": ts})
+    stats = await store.pet_visit_stats(1, now=now)
+    assert stats["drinks_today"] == 1
+    assert stats["last_drink_ts"] == day_start + 40

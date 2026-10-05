@@ -73,6 +73,18 @@ async def _stop_tasks(tasks: list[asyncio.Task[Any]]) -> None:
             log.exception("Background task %s failed during shutdown", task.get_name())
 
 
+async def _reattribute_at_startup(pet_registry: Any) -> None:
+    """Weight re-attribution at startup, never fatal.
+
+    It is a repair pass over stored history: if it fails, the add-on still
+    serves devices and the next reference-weight change runs it again.
+    """
+    try:
+        await pet_registry.reattribute_by_weight()
+    except Exception:
+        log.warning("Weight re-attribution at startup failed", exc_info=True)
+
+
 async def start_background(services: Services, app_instance: web.Application) -> None:
     """aiohttp on_startup hook: open the store, then spawn every service.
 
@@ -109,6 +121,9 @@ async def start_background(services: Services, app_instance: web.Application) ->
     # Same idea for events: re-derive event_kind/parent_event on rows stored
     # before those were understood, so old sessions group correctly.
     await backfill_event_rows(event_store)
+    # Then attribute weighed visits that claim no identity, against the
+    # current reference weights. Idempotent; identity rows are never touched.
+    await _reattribute_at_startup(pet_registry)
 
     # Both registries are constructed before the loop exists (nothing is
     # started in their constructors); this hands them the running loop so
@@ -224,6 +239,7 @@ async def start_background(services: Services, app_instance: web.Application) ->
         _spawn(app_instance, "ha-publisher", ha_publisher.start())
         _spawn(app_instance, "availability-watchdog",
                ha_publisher.availability_watchdog(config.offline_timeout))
+        _spawn(app_instance, "pet-day-rollover", ha_publisher.pet_day_rollover())
 
     # A BLE accessory reports only when we tell its parent to open a
     # session. Reacting to the parent's own traffic is not enough — a

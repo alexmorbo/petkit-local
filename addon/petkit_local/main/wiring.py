@@ -197,6 +197,7 @@ def build_services(config: Config, args: argparse.Namespace) -> Services:
     # this — the local cloud and the panel work with no Home Assistant at all.
     if ha_publisher is not None:
         ha_publisher.go2rtc = go2rtc
+        ha_publisher.set_pet_source(pet_registry, event_store)
 
     # Proxy mode's MQTT half. The credential store is loaded unconditionally
     # (it is a small JSON file and holds what previous proxied sessions

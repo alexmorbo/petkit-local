@@ -38,14 +38,23 @@ from petkit_local.ha.discovery import build_discovery_payload, discovery_topic
 from petkit_local.devices.state_parsers import apply_consumable_state
 from petkit_local.ha.commands import LOCAL_DEFAULTS, multi_config_texts
 from petkit_local.utils.jsonio import read_bytes
+from petkit_local.utils.timeutil import local_day_bounds
 
 if TYPE_CHECKING:
+    from petkit_local.ai.pets import PetRegistry
     from petkit_local.devices.ble import BLEDevice, BLERegistry
     from petkit_local.events.store import EventStore
     from petkit_local.mqtt.bridge import MQTTBridge
     from petkit_local.web.hub import EventHub
 
 log = logging.getLogger(__name__)
+
+
+def _iso(ts: float | None) -> str | None:
+    """A UTC ISO-8601 string for an HA `timestamp` sensor, or None."""
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 def device_is_stale(device: Device, now: float, timeout: int) -> bool:
@@ -113,6 +122,8 @@ class HAPublisher:
         self._client = None
         self._connected = False
         self._commands = CommandRouter(self, registry, ble_registry)
+        self._pets: PetRegistry | None = None
+        self._pet_store: EventStore | None = None
 
     @property
     def connected(self) -> bool:
@@ -129,6 +140,12 @@ class HAPublisher:
     def set_command_sink(self, sink: MQTTBridge) -> None:
         """Wire the MQTT bridge so HA setting changes reach the device in real time."""
         self._commands.set_command_sink(sink)
+
+    def set_pet_source(self, pets: PetRegistry, store: EventStore) -> None:
+        """Wire the pet registry and event store, so the publisher can replay
+        every pet on (re)connect and at local midnight without being asked."""
+        self._pets = pets
+        self._pet_store = store
 
     async def start(self) -> None:
         """Connect to the HA broker and serve commands, reconnecting forever.
@@ -205,6 +222,40 @@ class HAPublisher:
             for ble_dev in self._ble_registry.all():
                 await self.publish_ble_discovery(ble_dev)
                 await self.publish_ble_state(ble_dev)
+        await self.publish_all_pets()
+
+    async def publish_all_pets(self) -> None:
+        """Re-announce every pet and republish its (retained) state.
+
+        Run on every connect, alongside the devices: a pet's state is otherwise
+        published only when one of its events lands, so a broker that lost its
+        retained messages left every pet sensor `unknown` until the cat next
+        used the box. Also run at local midnight, so "today" counters reset
+        without waiting for an event. Never raises -- a store hiccup here must
+        not trip the reconnect backoff that `start()` applies to exceptions.
+        """
+        if self._pets is None or self._pet_store is None:
+            return
+        if not self._client or not self._connected:
+            return
+        try:
+            for pet in await self._pets.all():
+                await self.publish_pet_discovery(pet)
+                await self.publish_pet_state(pet, self._pet_store)
+        except Exception:
+            log.warning("Republishing pets failed", exc_info=True)
+
+    async def pet_day_rollover(self) -> None:
+        """Republish every pet just after each LOCAL midnight. Runs forever.
+
+        The next midnight comes from `local_day_bounds` every time, never a
+        fixed 86400 s: DST makes some days 23 and some 25 hours long.
+        """
+        while True:
+            now = time.time()
+            _, end, _ = local_day_bounds(now=now)
+            await asyncio.sleep(max(1.0, end - now + 1))
+            await self.publish_all_pets()
 
     async def availability_watchdog(self, timeout: int, interval: float | None = None) -> None:
         """Periodically flip stale devices to offline in HA. Runs forever.
@@ -435,17 +486,16 @@ class HAPublisher:
             if dev:
                 last_device_used = f"{dev.device_type.upper()} {dev.serial_number}".strip()
 
-        last_visit_iso = None
-        if stats.get("last_visit_ts"):
-            last_visit_iso = datetime.fromtimestamp(stats["last_visit_ts"], tz=timezone.utc).isoformat()
-
         state = {
             "state": {
-                "lastVisit": last_visit_iso,
+                "lastVisit": _iso(stats.get("last_visit_ts")),
                 "visitsToday": stats.get("visits_today", 0),
                 "lastVisitWeight": stats.get("last_visit_weight"),
                 "lastVisitDuration": stats.get("last_visit_duration"),
                 "lastDeviceUsed": last_device_used,
+                "weight": stats.get("weight"),
+                "lastDrink": _iso(stats.get("last_drink_ts")),
+                "drinksToday": stats.get("drinks_today", 0),
             }
         }
         topic = f"petkit-local/pet/{pet['id']}/state"

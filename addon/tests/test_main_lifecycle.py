@@ -16,7 +16,8 @@ from aiohttp import web
 from petkit_local.devices.registry import DeviceRegistry
 from petkit_local.http.proxy import close_proxy_session, get_proxy_session
 from petkit_local.http.server import create_app
-from petkit_local.main.lifecycle import BACKGROUND_TASKS, _spawn, _stop_tasks
+from petkit_local.main.lifecycle import (BACKGROUND_TASKS, _reattribute_at_startup, _spawn,
+                                         _stop_tasks)
 
 CONFIG = {
     "api_url": "http://server/6/",
@@ -337,3 +338,30 @@ def _capture() -> _Collector:
 def _release(handler: _Collector) -> str:
     logging.getLogger("petkit_local.main").removeHandler(handler)
     return "\n".join(handler.lines)
+
+
+class _BrokenPetRegistry:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def reattribute_by_weight(self):
+        self.calls += 1
+        raise RuntimeError("db is unhappy")
+
+
+async def test_a_failing_weight_reattribution_does_not_break_startup(caplog):
+    pets = _BrokenPetRegistry()
+    with caplog.at_level(logging.WARNING, logger="petkit_local.main.lifecycle"):
+        await _reattribute_at_startup(pets)  # must not raise
+    assert pets.calls == 1
+    record = next(r for r in caplog.records
+                  if r.getMessage() == "Weight re-attribution at startup failed")
+    assert record.levelno == logging.WARNING
+    assert record.exc_info is not None
+
+
+def test_startup_reattributes_through_the_guarded_helper():
+    source = LIFECYCLE_PY.read_text()
+    start = source.split("async def start_background(", 1)[1].split("async def cleanup_background(", 1)[0]
+    assert "await _reattribute_at_startup(pet_registry)" in start
+    assert "await pet_registry.reattribute_by_weight()" not in start

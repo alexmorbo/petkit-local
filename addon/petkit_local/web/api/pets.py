@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -32,13 +33,59 @@ from petkit_local.web.api._common import (
 log = logging.getLogger(__name__)
 
 
+def _reference_weight(value: Any) -> tuple[bool, float | None]:
+    """Parse a reference weight from the panel: `(usable, grams or None)`.
+
+    None or "" clears the reference (usable, None); zero or negative clears it
+    too, since no pet weighs that. Anything that will not parse as a finite
+    number is NOT usable and the caller leaves the stored value alone -- the
+    same skip-on-garbage rule `device_ids` follows. Whole grams, as the scale
+    reports them.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return True, None
+    if isinstance(value, bool):
+        return False, None
+    try:
+        grams = float(value)
+    except (TypeError, ValueError):
+        return False, None
+    if not math.isfinite(grams):
+        return False, None
+    if grams <= 0:
+        return True, None
+    return True, float(round(grams))
+
+
+async def _reattribute(request: web.Request) -> int:
+    """Re-run weight attribution over history and republish the pets it moved.
+
+    Returns how many event rows changed. A pet that no longer exists (it was
+    just deleted) is skipped -- there is no device left to publish to.
+    """
+    pet_registry = request.app.get("pet_registry")
+    if pet_registry is None:
+        return 0
+    changed, affected = await pet_registry.reattribute_by_weight()
+    ha_publisher = request.app.get("ha_publisher")
+    store = request.app.get("event_store")
+    if ha_publisher is not None and store is not None:
+        for pid in sorted(affected):
+            pet = await pet_registry.get(pid)
+            if pet is not None:
+                await ha_publisher.publish_pet_state(pet, store)
+    return changed
+
+
 async def api_pets_list_create(request: web.Request) -> web.Response:
     """List the pets, or create one.
 
-    GET answers `{"pets": [...]}`, POST `{"pet": {...}}`. A `name` is required;
-    unparseable `device_ids` degrade to "no devices" rather than failing the
-    create, since the link can be fixed afterwards. A new pet is immediately
-    published to HA as its own virtual device.
+    GET answers `{"pets": [...]}`, POST `{"pet": {...}, "reattributed": n}`. A
+    `name` is required; unparseable `device_ids` degrade to "no devices" rather
+    than failing the create, since the link can be fixed afterwards, and an
+    unparseable `weight` to no reference. A new pet is immediately published to
+    HA as its own virtual device, and one with a reference weight takes its
+    share of the unattributed visits (`ai/pets.py::nearest_pet_by_weight`).
     """
     pet_registry = request.app.get("pet_registry")
     if pet_registry is None:
@@ -57,11 +104,14 @@ async def api_pets_list_create(request: web.Request) -> web.Response:
     except (TypeError, ValueError):
         device_ids = []
 
-    pet = await pet_registry.create(name, device_ids=device_ids, weight=body.get("weight"))
+    _, weight = _reference_weight(body.get("weight"))
+
+    pet = await pet_registry.create(name, device_ids=device_ids, weight=weight)
     ha_publisher = request.app.get("ha_publisher")
     if ha_publisher is not None:
         await ha_publisher.publish_pet_discovery(pet)
-    return web.json_response({"pet": pet})
+    reattributed = await _reattribute(request) if weight is not None else 0
+    return web.json_response({"pet": pet, "reattributed": reattributed})
 
 
 async def api_pet_detail(request: web.Request) -> web.Response:
@@ -70,7 +120,9 @@ async def api_pet_detail(request: web.Request) -> web.Response:
     GET/POST answer `{"pet": {...}}`, DELETE `{"ok": bool}`.
     POST is a partial update: only the fields present in the body are touched,
     and a `device_ids` that will not parse is skipped rather than clearing the
-    links.
+    links. Same for `weight` (the reference visits are attributed against):
+    garbage is skipped, null/""/0 clears it. A POST or DELETE that can change
+    weight attribution re-runs it over history and adds `reattributed`.
     """
     pet_registry = request.app.get("pet_registry")
     if pet_registry is None:
@@ -78,7 +130,9 @@ async def api_pet_detail(request: web.Request) -> web.Response:
     pid = _path_id(request)
 
     if request.method == "DELETE":
-        return web.json_response({"ok": await pet_registry.delete(pid)})
+        ok = await pet_registry.delete(pid)
+        reattributed = await _reattribute(request) if ok else 0
+        return web.json_response({"ok": ok, "reattributed": reattributed})
 
     if request.method == "GET":
         pet = await pet_registry.get(pid)
@@ -113,7 +167,9 @@ async def api_pet_detail(request: web.Request) -> web.Response:
         except (TypeError, ValueError):
             pass
     if "weight" in body:
-        fields["weight"] = body["weight"]
+        usable, weight = _reference_weight(body["weight"])
+        if usable:
+            fields["weight"] = weight
 
     pet = await pet_registry.update(pid, **fields)
     if pet is None:
@@ -155,10 +211,17 @@ async def api_pet_detail(request: web.Request) -> web.Response:
                     other, device_pet_ids_json=json.dumps([a for a in aliases if a != ref]))
             bound += await store.bind_pet_ref(ref, pid)
 
+    reattributed = 0
+    if "weight" in fields and fields["weight"] != before.get("weight"):
+        reattributed = await _reattribute(request)
+
     ha_publisher = request.app.get("ha_publisher")
     if ha_publisher is not None:
         await ha_publisher.publish_pet_discovery(pet)
-    return web.json_response({"pet": pet, "bound_events": bound})
+        if store is not None:
+            await ha_publisher.publish_pet_state(pet, store)
+    return web.json_response({"pet": pet, "bound_events": bound,
+                              "reattributed": reattributed})
 
 
 async def api_pet_faces(request: web.Request) -> web.Response:

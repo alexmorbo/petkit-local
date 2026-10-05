@@ -101,6 +101,8 @@ function petsSection(pets, ds, aiDevices, recognisingIds) {
       </p>
       <div class="newpet">
         <input id="newPetName" placeholder="Name" aria-label="Pet name">
+        <input id="newPetWeight" type="number" min="0" step="1" placeholder="Weight, g"
+               aria-label="Reference weight in grams (optional)">
         <select id="newPetDevice" aria-label="Assign to device">${aiDevices
           .map(d => `<option value="${esc(d.id)}">${esc(d.name)}</option>`)
           .join('')}</select>
@@ -193,6 +195,10 @@ function petCard(p, ds, recognisingIds) {
     <div class="pet-head">
       <b class="pet-name" data-action="rename-pet" data-id="${esc(p.id)}"
          title="Click to rename">${esc(p.name)}</b>
+      <span class="pet-weight" data-action="edit-pet-weight" data-id="${esc(p.id)}"
+            data-weight="${esc(p.weight ?? '')}"
+            title="Reference weight in grams. Litter-box visits that report no identity go to the pet whose reference is nearest."
+            >${p.weight ? esc(Math.round(p.weight)) + ' g' : 'set weight'}</span>
       <span class="pet-devs">${chips || '<span class="mut">no devices assigned</span>'}</span>
       <button class="ghost act" data-action="delete-pet" data-id="${esc(p.id)}">Delete</button>
     </div>
@@ -291,6 +297,52 @@ onAction('rename-pet', el => {
   input.select();
 });
 
+// The reference weight a litter box with no camera attributes visits by. Same
+// in-place pattern as the rename above; an empty field clears the reference,
+// which takes the pet out of weight matching altogether.
+onAction('edit-pet-weight', el => {
+  const id = el.dataset.id;
+  const before = el.dataset.weight || '';
+  const input = document.createElement('input');
+  input.className = 'pet-weight-edit';
+  input.type = 'number';
+  input.min = '0';
+  input.step = '1';
+  input.placeholder = 'grams';
+  input.value = before ? String(Math.round(Number(before))) : '';
+
+  let done = false;
+  const finish = async save => {
+    if (done) return;
+    done = true;
+    const raw = input.value.trim();
+    input.replaceWith(el);
+    if (!save) return;
+    const weight = raw === '' ? null : Number(raw);
+    if (weight !== null && !(weight >= 0)) return toast('Weight must be a number of grams');
+    const was = before === '' ? null : Math.round(Number(before));
+    if (weight === was || (weight !== null && was !== null && Math.round(weight) === was)) return;
+    const r = await api('pets/' + encodeURIComponent(id), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ weight }),
+    });
+    if (r.error) return toast('Error: ' + r.error);
+    const n = r.reattributed || 0;
+    toast('Saved' + (n ? ` · ${n} visit${n === 1 ? '' : 's'} re-attributed` : ''));
+    loadPets();
+  };
+
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') finish(true);
+    else if (e.key === 'Escape') finish(false);
+  });
+  input.addEventListener('blur', () => finish(true));
+  el.replaceWith(input);
+  input.focus();
+  input.select();
+});
+
 onAction('add-pet', () => addPet());
 onAction('delete-pet', el => deletePet(el.dataset.id));
 onAction('delete-face', el => deleteFace(el.dataset.id, el.dataset.face));
@@ -331,12 +383,19 @@ async function addPet() {
   if (!name) return toast('Name required');
   const devSel = document.getElementById('newPetDevice');
   const device_ids = devSel.value ? [Number(devSel.value)] : [];
+  const weightRaw = document.getElementById('newPetWeight').value.trim();
+  const weight = weightRaw === '' ? null : Number(weightRaw);
   const r = await api('pets', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name, device_ids: device_ids }),
+    body: JSON.stringify({ name: name, device_ids: device_ids, weight: weight }),
   });
-  toast(r.pet ? 'Pet added' : 'Error: ' + (r.error || 'failed'));
+  const n = r.reattributed || 0;
+  toast(
+    r.pet
+      ? 'Pet added' + (n ? ` · ${n} visit${n === 1 ? '' : 's'} attributed by weight` : '')
+      : 'Error: ' + (r.error || 'failed'),
+  );
   loadPets();
 }
 

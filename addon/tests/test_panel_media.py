@@ -27,12 +27,16 @@ class FakeHAPublisher:
     def __init__(self):
         self.states = []
         self.pet_discoveries = []
+        self.pet_states = []
 
     async def publish_state(self, device):
         self.states.append(device.petkit_id)
 
     async def publish_pet_discovery(self, pet):
         self.pet_discoveries.append(pet["id"])
+
+    async def publish_pet_state(self, pet, store):
+        self.pet_states.append(pet["id"])
 
 
 def _midday() -> float:

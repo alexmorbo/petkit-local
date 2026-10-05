@@ -439,6 +439,21 @@ def apply_state_snapshot(device: Device, state: Any) -> bool:
     return True
 
 
+def pet_weight_of(content: dict) -> float | None:
+    """The pet weight a visit's `content` reports, in grams, or None.
+
+    Both spellings occur (`pet_weight`, `petWeight`). A zero or negative value
+    is the scale reporting nothing, not a weightless cat, so it reads as None.
+    Never raises on device input.
+    """
+    if not isinstance(content, dict):
+        return None
+    weight = to_float(content.get("pet_weight", content.get("petWeight")), None)
+    if weight is None or weight <= 0:
+        return None
+    return weight
+
+
 def apply_derived_state(device: Device, event_type: str, content: dict) -> None:
     """Fold into `device.state` the values that only an EVENT ever carries.
 
@@ -463,7 +478,7 @@ def apply_derived_state(device: Device, event_type: str, content: dict) -> None:
     elif code.kind == codes.KIND_TOILET and code.role == codes.ROLE_VISIT_SUMMARY:
         device.state["lastVisit"] = _now_iso()
         # Weight rides in the content, never in params or the state block.
-        weight = to_float(content.get("pet_weight", content.get("petWeight")), None)
+        weight = pet_weight_of(content)
         if weight is not None:
             device.state["petWeight"] = weight
 

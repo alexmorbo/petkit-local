@@ -1406,6 +1406,15 @@ DONE_CODES = _codes_where(ALL_EVENT_CODES, role=ROLE_DONE)
 #: detail -- it is the line that heads an unparented cycle's card and the one
 #: that carries the episode's waste photos.
 PRIMARY_DONE_CODES = DONE_CODES - _codes_where(ALL_EVENT_CODES, detail=True)
+#: The one report per drink: `drink_over` / fountain HTTP `6`. Keyed per table
+#: rather than read off `ALL_EVENT_CODES`, where the litter table shadows the
+#: fountain's numeric codes. Only meaningful together with
+#: `event_kind == KIND_DRINKING`, which is what disambiguates a bare "6".
+DRINK_DONE_CODES = frozenset().union(
+    _codes_where(MQTT_EVENT_TOPICS, kind=KIND_DRINKING, role=ROLE_DONE),
+    *(_codes_where(table, kind=KIND_DRINKING, role=ROLE_DONE)
+      for table in HTTP_CODES_BY_CATEGORY.values()),
+)
 
 
 def lookup(event_type: str | None,
@@ -1436,6 +1445,20 @@ def lookup(event_type: str | None,
     # A category with a sparse table (the feeder's, mostly unrecovered) still
     # gets MQTT names, which ARE global.
     return MQTT_EVENT_TOPICS.get(key.lower())
+
+
+def is_visit_summary(event_type: str | None, device_type: str | None = None) -> bool:
+    """True for the ONE report of a litter-box visit that carries its result.
+
+    That is HTTP `10` / MQTT `pet_out`. The visit's `pet_in` (and HTTP `9`)
+    carry a weight too, but a PARTIAL one sampled while the pet is still
+    stepping in (live: `pet_in` 2351 g against `pet_out` 4623 g for the same
+    visit), so anything that reads a pet's weight from a visit must read it
+    from this row and no other. Pass `device_type`: the codes are per category.
+    """
+    code = lookup(event_type, device_type)
+    return (code is not None and code.kind == KIND_TOILET
+            and code.role == ROLE_VISIT_SUMMARY)
 
 
 def codes_for(device_type: str | None) -> dict[str, EventCode]:

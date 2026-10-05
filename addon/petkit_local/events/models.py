@@ -26,6 +26,10 @@ from sqlalchemy import REAL, Index, Integer, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
+#: `events.pet_source` for a row attributed by the scale rather than by face.
+PET_SOURCE_WEIGHT = "weight"
+
+
 class Base(DeclarativeBase):
     """Declarative base that can render a row as a plain dict.
 
@@ -94,6 +98,12 @@ class Event(Base):
     #: `ai/pets.py::PetRegistry.resolve_pet_ref` maps this to a real pet.
     pet_ref: Mapped[int | None] = mapped_column(Integer)
     pet_id: Mapped[int | None] = mapped_column(Integer)
+    #: HOW `pet_id` was decided. NULL means identity (a resolved `pet_ref`) or
+    #: nothing; `PET_SOURCE_WEIGHT` means `ai/pets.py` picked the pet whose
+    #: reference weight is nearest the visit's. Only weight-sourced rows are
+    #: ever re-attributed when a reference changes -- an identity is never
+    #: overwritten by a guess from the scale.
+    pet_source: Mapped[str | None] = mapped_column(Text)
     score: Mapped[float | None] = mapped_column(REAL)
     content_json: Mapped[str | None] = mapped_column(Text)
     state_json: Mapped[str | None] = mapped_column(Text)

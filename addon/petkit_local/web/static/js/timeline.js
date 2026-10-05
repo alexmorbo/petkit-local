@@ -434,6 +434,7 @@ function dbgBody(d) {
     // against faces cached from PetKit's cloud — bind it in the Pets tab.
     ['Reported pet id', e.pet_ref],
     ['Pet', e.pet_name || e.pet_id],
+    ['Matched by', e.pet_source],
     ['Match score', e.score],
   ]
     .filter(([, v]) => v !== null && v !== undefined && v !== '')
@@ -495,8 +496,10 @@ function sessionCard(s) {
   }
   // Who the device's NPU recognised. Absent when it recognised nobody, which
   // is normal for a passing glance — most "appeared" episodes have no match.
+  // A litter box with no camera names the pet by its weight instead.
+  const petTitle = s.pet_source === 'weight' ? ' title="matched by weight"' : '';
   const pet = s.pet_name
-    ? `<span class="tl-pet">${s.pet_photo_url ? `<img src="${BASE}${esc(s.pet_photo_url)}" alt="">` : ''}${esc(s.pet_name)}</span>`
+    ? `<span class="tl-pet"${petTitle}>${s.pet_photo_url ? `<img src="${BASE}${esc(s.pet_photo_url)}" alt="">` : ''}${esc(s.pet_name)}</span>`
     : '';
   const head = `<span class="tl-kind ${cls}">${esc(tag)}</span>${pet}${title}`;
   const subs = s.sub_events || [];

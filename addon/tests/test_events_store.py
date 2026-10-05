@@ -280,6 +280,7 @@ async def test_migrate_adds_columns_to_an_existing_database_in_place():
         assert len(events) == 1, "existing rows must survive the migration"
         assert events[0]["event_uid"] == "e1"
         assert events[0]["parent_event"] is None
+        assert events[0]["pet_source"] is None
         media = await store.get_media_by_file_id("f1")
         assert media["stitch_state"] is None
 
@@ -287,6 +288,8 @@ async def test_migrate_adds_columns_to_an_existing_database_in_place():
         assert await store.update_event_fields(events[0]["id"], parent_event="p1") is True
         await store.mark_stitch_failed([media["id"]], "failed")
         assert (await store.get_event(events[0]["id"]))["parent_event"] == "p1"
+        assert await store.update_event_fields(events[0]["id"], pet_source="weight") is True
+        assert (await store.get_event(events[0]["id"]))["pet_source"] == "weight"
         assert (await store.get_media_by_file_id("f1"))["stitch_state"] == "failed"
         await store.close()
 

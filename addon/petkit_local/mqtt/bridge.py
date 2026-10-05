@@ -499,9 +499,10 @@ class MQTTBridge:
         if self._event_store is not None and event_type not in codes.MQTT_TRANSPORT_TOPICS:
             row = ingest.from_mqtt(device, event_type, params)
             # Same rule as the HTTP path: only an identity we can prove is ours
-            # becomes `pet_id` (see ai/pets.py::resolve_pet_ref).
+            # becomes `pet_id` (see ai/pets.py::resolve_pet_ref), and a visit
+            # that claims nobody may be attributed by weight (`attribute`).
             if self._pet_registry is not None:
-                row["pet_id"] = await self._pet_registry.resolve_pet_ref(row.get("pet_ref"))
+                await self._pet_registry.attribute(row)
             await self._event_store.upsert_event(row)
             if self._hub is not None:
                 self._hub.publish("event", device.petkit_id, f"{event_type} ({row['event_kind']})")

@@ -21,9 +21,13 @@ import json
 import logging
 import os
 import re
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from petkit_local.events import codes
+from petkit_local.events.models import PET_SOURCE_WEIGHT
+from petkit_local.events.normalize import _as_dict, pet_weight_of
 from petkit_local.media.transcode import normalize_face_photo
 from petkit_local.utils.coerce import to_int
 from petkit_local.utils.paths import UnsafePathError, safe_join, sanitize_filename
@@ -91,6 +95,63 @@ def _write_photo(path: str, data: bytes) -> None:
 #: `add_face` enforces, applied before the download rather than after, so a
 #: reply claiming a hundred faces costs a hundred fetches to discover that.
 MAX_CLOUD_FACES = 10
+
+
+#: A visit further than this from EVERY pet's reference weight is left
+#: unattributed: a bag of litter on the scale, a cleaning cycle, a visiting
+#: kitten. Grams, as the scale reports them.
+WEIGHT_OUTLIER_GUARD_G = 1000.0
+
+#: How much nearer the best pet has to be than the runner-up. Zero is pure
+#: nearest-wins, the operator's rule; only an EXACT tie stays unattributed,
+#: because there is nothing to pick between.
+WEIGHT_AMBIGUITY_MARGIN_G = 0.0
+
+
+def nearest_pet_by_weight(weight_g: float | None, refs: Mapping[int, float], *,
+                          guard_g: float = WEIGHT_OUTLIER_GUARD_G,
+                          margin_g: float = WEIGHT_AMBIGUITY_MARGIN_G) -> int | None:
+    """The pet whose reference weight is nearest `weight_g`, or None.
+
+    None when there is no weight or no reference, when even the nearest pet
+    is more than `guard_g` away, or when the runner-up is within `margin_g`
+    of it (with the default 0, an exact tie). Which pets are linked to which
+    device does not enter into it: `device_ids_json` says where a pet's face
+    photos are served, not which litter box it uses, and a weight means the
+    same thing on any scale.
+    """
+    if weight_g is None or weight_g <= 0 or not refs:
+        return None
+    ranked = sorted((abs(weight_g - ref), pid) for pid, ref in refs.items())
+    best_d, best = ranked[0]
+    if best_d > guard_g:
+        return None
+    if len(ranked) > 1 and ranked[1][0] - best_d <= margin_g:
+        return None
+    return best
+
+
+def plan_weight_reattribution(rows: Iterable[dict[str, Any]],
+                              refs: Mapping[int, float]) -> list[tuple[int, int | None]]:
+    """`(event_id, pet_id)` changes that make weight attribution current.
+
+    `rows` are `EventStore.weight_attribution_candidates`. Only a visit
+    summary is attributed (a `pet_in` weight is partial, see
+    `codes.is_visit_summary`), and a row is emitted only when its answer
+    changed, so a second run with the same references plans nothing.
+    """
+    out: list[tuple[int, int | None]] = []
+    for row in rows:
+        current = row.get("pet_id") if row.get("pet_source") == PET_SOURCE_WEIGHT else None
+        if codes.is_visit_summary(row.get("event_type"), row.get("device_type")):
+            new = nearest_pet_by_weight(pet_weight_of(_as_dict(row.get("content_json"))), refs)
+        else:
+            # A weight-sourced pet on a row that is not a visit summary is
+            # stale (written under an older rule): clear it.
+            new = None
+        if new != current:
+            out.append((row["id"], new))
+    return out
 
 
 def cloud_pets(payload: Any, device_id: int) -> list[dict[str, Any]]:
@@ -369,6 +430,69 @@ class PetRegistry:
             if pet_ref in aliases:
                 return pet["id"]
         return None
+
+    async def weight_references(self) -> dict[int, float]:
+        """`{pet_id: reference grams}` for every pet with a positive weight."""
+        refs: dict[int, float] = {}
+        for pet in await self.all():
+            try:
+                weight = float(pet.get("weight"))
+            except (TypeError, ValueError):
+                continue
+            if weight > 0:
+                refs[pet["id"]] = weight
+        return refs
+
+    async def attribute(self, row: dict[str, Any]) -> None:
+        """Decide `pet_id` / `pet_source` for an event row about to be stored.
+
+        Identity first: a reported `pet_ref` resolves through
+        `resolve_pet_ref` or leaves the row unattributed -- an unresolved ref
+        is still a claim, so it is never overridden by the scale. Only a
+        litter-box visit summary that claims nobody falls through to
+        `nearest_pet_by_weight`.
+        """
+        row["pet_id"] = await self.resolve_pet_ref(row.get("pet_ref"))
+        row["pet_source"] = None
+        if row["pet_id"] is not None or row.get("pet_ref") is not None:
+            return
+        if row.get("event_kind") != codes.KIND_TOILET:
+            return
+        if not codes.is_visit_summary(row.get("event_type"), row.get("device_type")):
+            return
+        content = row.get("_content")
+        if not isinstance(content, dict):
+            content = _as_dict(row.get("content_json"))
+        pid = nearest_pet_by_weight(pet_weight_of(content), await self.weight_references())
+        if pid is not None:
+            row["pet_id"] = pid
+            row["pet_source"] = PET_SOURCE_WEIGHT
+
+    async def reattribute_by_weight(self) -> tuple[int, set[int]]:
+        """Re-run weight attribution over the stored history.
+
+        For after a reference weight is set, changed or removed, or a pet is
+        created or deleted. Never touches a row with an identity (see
+        `EventStore._weight_owned`). Returns `(rows changed, pet ids whose
+        history changed)` -- both the pets that lost rows and the ones that
+        gained them, so the caller can republish exactly those.
+        """
+        rows = await self._store.weight_attribution_candidates()
+        plan = plan_weight_reattribution(rows, await self.weight_references())
+        if not plan:
+            return 0, set()
+        before = {r["id"]: r.get("pet_id") for r in rows
+                  if r.get("pet_source") == PET_SOURCE_WEIGHT}
+        changed = await self._store.apply_weight_attribution(plan)
+        affected: set[int] = set()
+        for event_id, pid in plan:
+            if before.get(event_id) is not None:
+                affected.add(before[event_id])
+            if pid is not None:
+                affected.add(pid)
+        if changed:
+            log.info("Re-attributed %d visit(s) by weight", changed)
+        return changed, affected
 
     async def pet_for_related_event(self, related_event: str) -> dict | None:
         """Best-effort pet lookup for a visit session — used by

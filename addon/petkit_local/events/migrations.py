@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from petkit_local.events.models import PET_SOURCE_WEIGHT
 from petkit_local.events.normalize import (_as_dict, _extract_pet_ref, _parent_event_of,
                                            classify_event_kind)
 
@@ -71,6 +72,12 @@ async def backfill_event_rows(store: EventStore) -> int:
             ref = _extract_pet_ref(content)
             if ref is not None and ref != row.get("pet_ref"):
                 updates["pet_ref"] = ref
+                # Identity outranks the scale: a row the weight matcher filled
+                # is handed back to the reported identity, which
+                # `resolve_pet_ref` / `bind_pet_ref` own from here.
+                if row.get("pet_source") == PET_SOURCE_WEIGHT:
+                    updates["pet_id"] = None
+                    updates["pet_source"] = None
 
             if updates:
                 await store.update_event_fields(row["id"], **updates)

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Litter-box visits without a face match go to a pet by weight.** A T6 has
+  no camera, so every visit it reported was anonymous. Give each pet a
+  reference weight in the Pets tab (click "set weight" next to its name): a
+  visit goes to the pet whose reference is nearest, an exact tie stays
+  anonymous, and one more than 1000 g from every reference (litter bag,
+  cleaning) is left alone. Only the visit's closing report is matched, never
+  the partial "pet entered" weight. A face match or a bound PetKit id always
+  wins, and changing a reference re-sorts only the weight-matched history.
+  The Timeline's Debug info shows `Matched by: weight` on those visits.
+  A reported pet weight of 0 no longer overwrites the device's "Pet Weight"
+  and last visit weight; they keep the previous value.
+
+- **New per-pet sensors: Weight, Last Drink and Drinks Today.** Weight is the
+  median of the pet's last seven weighed visits (grams, `measurement`), the
+  drink pair counts recognised drinks at a fountain since local midnight.
+
+- **Pet sensors no longer read unknown after Home Assistant's broker
+  restarts.** Every pet is re-announced and its state republished (retained)
+  on each connect to HA's broker, and again just after local midnight so
+  Visits Today and Drinks Today reset without waiting for the next event.
+
 - **Proxy mode now teaches Home Assistant the settings you change in PetKit's
   app.** A W7H reports none of its settings, so most of its controls read
   unknown until set from HA. With proxy mode on, every setting the cloud sends

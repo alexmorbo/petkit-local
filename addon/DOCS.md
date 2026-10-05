@@ -147,6 +147,28 @@ There is no snapshot URL: the device answers every path with the same video
 stream, so the MQTT camera entity stays empty and the sensor carries the URL
 instead.
 
+## Pets in Home Assistant
+
+Each pet in the panel's **Pets** tab becomes its own device in Home Assistant,
+with its visits, weight and drinks. A camera box or fountain knows which pet it
+saw by face. A litter box without a camera (a T6) reports only a weight, so
+those visits go to a pet by its **reference weight**: click the weight next to
+the pet's name (or "set weight") and enter it in grams.
+
+- A visit goes to the pet whose reference is **nearest** its weight. An exact
+  tie between two pets stays unattributed.
+- A visit more than **1000 g** from every reference stays unattributed — a bag
+  of litter on the scale, a cleaning cycle, a visiting kitten.
+- Only the visit's closing report counts; the "pet entered" weight is partial.
+- Which devices a pet is assigned to does not matter here: the assignment says
+  where its face photos go, not which litter box it uses.
+- A face match or a bound PetKit id always wins and is never changed by
+  weight. Setting, changing or clearing a reference (or adding or deleting a
+  pet) re-sorts the past weight-matched visits right away.
+
+The pet's **Weight** sensor is the median of its last seven weighed visits. It
+never changes the reference, so a wrong match cannot drift it.
+
 ## Provisioning over Bluetooth
 
 The **Provision** tab hands a device its Wi-Fi credentials, a custom `apiServers`

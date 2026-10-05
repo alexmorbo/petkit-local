@@ -26,4 +26,14 @@ PET_SENSORS = [
               icon="mdi:timer-outline"),
     EntityDef(component="sensor", key="last_device_used", name="Last Device Used",
               value_path="state.lastDeviceUsed", icon="mdi:home-floor-a"),
+    # The OBSERVED weight: median of the newest weighed visits. The pet's
+    # reference weight (what visits are attributed against) is user-set in the
+    # panel and never follows this, so a misattribution cannot feed back.
+    EntityDef(component="sensor", key="weight", name="Weight",
+              value_path="state.weight", device_class="weight", unit="g",
+              state_class="measurement", icon="mdi:scale-bathroom"),
+    EntityDef(component="sensor", key="last_drink", name="Last Drink",
+              value_path="state.lastDrink", device_class="timestamp", icon="mdi:cup-water"),
+    EntityDef(component="sensor", key="drinks_today", name="Drinks Today",
+              value_path="state.drinksToday", icon="mdi:counter"),
 ]

@@ -313,3 +313,19 @@ def test_litter_ble_relay_codes_are_system_detail():
 def test_feed_result_9_is_mapped():
     """Observed on a live D4SH with empty hoppers."""
     assert 9 in codes.FEED_RESULT
+
+
+def test_is_visit_summary_is_the_one_visit_report_that_carries_the_result():
+    assert codes.is_visit_summary("10", "t5")
+    assert codes.is_visit_summary("10", "t6")
+    assert codes.is_visit_summary("pet_out", "t6")
+    # `pet_in` / HTTP 9 carry a PARTIAL weight, sampled while stepping in.
+    assert not codes.is_visit_summary("pet_in", "t6")
+    assert not codes.is_visit_summary("9", "t5")
+    # Per category: a feeder's "10" is not a litter visit.
+    assert not codes.is_visit_summary("10", "d4h")
+    assert not codes.is_visit_summary(None)
+
+
+def test_drink_done_codes_are_one_report_per_drink():
+    assert codes.DRINK_DONE_CODES == {"drink_over", "6"}

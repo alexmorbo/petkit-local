@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import statistics
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,7 +24,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import URL, delete, event as sa_event, func, insert, select, update
+from sqlalchemy import URL, delete, event as sa_event, func, insert, or_, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -33,7 +34,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from petkit_local.events import codes
-from petkit_local.events.models import Base, BlockedAttempt, Event, Media, Pet, PetFace
+from petkit_local.events.models import (PET_SOURCE_WEIGHT, Base, BlockedAttempt, Event, Media,
+                                        Pet, PetFace)
+from petkit_local.events.normalize import _as_dict, pet_weight_of
 from petkit_local.utils.timeutil import local_day_start
 
 log = logging.getLogger(__name__)
@@ -51,10 +54,27 @@ _NO_SYNC = {"synchronize_session": False}
 # Columns added after the first release — SQLite has no "ADD COLUMN IF NOT
 # EXISTS", so `_migrate` adds any that a pre-existing database is missing.
 _ADDED_COLUMNS = {
-    "events": {"parent_event": "TEXT", "pet_ref": "INTEGER"},
+    "events": {"parent_event": "TEXT", "pet_ref": "INTEGER", "pet_source": "TEXT"},
     "media": {"stitch_state": "TEXT"},
     "pets": {"device_pet_ids_json": "TEXT"},
 }
+
+
+#: How many of a pet's newest weighed visits its `weight` sensor is the median
+#: of. A median, not a mean, so one visit with a bag of litter on the scale
+#: moves nothing.
+WEIGHT_MEDIAN_SAMPLES = 7
+
+
+def _weight_owned() -> tuple[Any, ...]:
+    """WHERE clauses for an event the scale may (re)attribute.
+
+    No reported identity, and a `pet_id` that is either empty or was put there
+    by the scale. Every weight write re-checks this in its own UPDATE, so an
+    identity that landed between planning and applying is never overwritten.
+    """
+    return (Event.pet_ref.is_(None),
+            or_(Event.pet_id.is_(None), Event.pet_source == PET_SOURCE_WEIGHT))
 
 
 def _writable(model: type[Base]) -> tuple[str, ...]:
@@ -833,6 +853,41 @@ class EventStore:
                 execution_options=_NO_SYNC)
             return int(result.rowcount or 0)
 
+    async def weight_attribution_candidates(self) -> list[dict[str, Any]]:
+        """Toilet rows the scale may attribute, with what planning needs.
+
+        `[{id, event_type, device_type, content_json, pet_id, pet_source}]`.
+        Which of them is a visit summary is decided by the caller through
+        `codes.is_visit_summary`, because that needs the device type.
+        """
+        async with self._read() as session:
+            rows = await session.execute(
+                select(Event.id, Event.event_type, Event.device_type, Event.content_json,
+                       Event.pet_id, Event.pet_source)
+                .where(Event.event_kind == codes.KIND_TOILET, *_weight_owned())
+                .order_by(Event.id))
+            return [dict(r._mapping) for r in rows]
+
+    async def apply_weight_attribution(self, changes: list[tuple[int, int | None]]) -> int:
+        """Set `(event_id, pet_id)` pairs as weight attributions; returns rows changed.
+
+        `pet_id=None` clears a weight attribution. One transaction for the
+        whole plan, and each UPDATE re-checks `_weight_owned`.
+        """
+        if not changes:
+            return 0
+        changed = 0
+        async with self._write() as session:
+            for event_id, pet_id in changes:
+                result = await session.execute(
+                    update(Event)
+                    .where(Event.id == event_id, *_weight_owned())
+                    .values(pet_id=pet_id,
+                            pet_source=PET_SOURCE_WEIGHT if pet_id is not None else None),
+                    execution_options=_NO_SYNC)
+                changed += int(result.rowcount or 0)
+        return changed
+
     async def pets_claiming_ref(self, pet_ref: int) -> list[int]:
         """Ids of every pet whose alias list contains `pet_ref`.
 
@@ -855,9 +910,15 @@ class EventStore:
         """Aggregate stats backing one pet's virtual HA device.
 
         Returns `{last_visit_ts, visits_today, last_visit_weight,
-        last_visit_duration, last_device_id}`, every value None/0 for a pet
-        that has never been recognised - the entities exist from the moment
-        the pet does (see ha/publisher.py::publish_pet_state).
+        last_visit_duration, last_device_id, weight, last_drink_ts,
+        drinks_today}`, every value None/0 for a pet that has never been
+        recognised - the entities exist from the moment the pet does (see
+        ha/publisher.py::publish_pet_state).
+
+        `weight` is the median of the newest `WEIGHT_MEDIAN_SAMPLES` visit
+        SUMMARIES that carry a weight -- never a `pet_in`, whose weight is
+        partial (`codes.is_visit_summary`). Drinks count one report per drink
+        (`codes.DRINK_DONE_CODES`), so a start/done pair is not two drinks.
 
         `visits_today` counts from LOCAL midnight, which is the boundary the
         owner means by "today". Counting from UTC midnight instead credits a
@@ -867,6 +928,8 @@ class EventStore:
         now = now if now is not None else time.time()
         day_start = local_day_start(now)
         visit = (Event.pet_id == pet_id, Event.event_kind == codes.KIND_TOILET)
+        drink = (Event.pet_id == pet_id, Event.event_kind == codes.KIND_DRINKING,
+                 Event.event_type.in_(codes.DRINK_DONE_CODES))
 
         async with self._read() as session:
             latest_row = await session.scalar(
@@ -888,16 +951,13 @@ class EventStore:
                         content = json.loads(latest["content_json"])
                     except (json.JSONDecodeError, TypeError):
                         content = {}
-                w = content.get("pet_weight", content.get("petWeight"))
-                try:
-                    # The scale reports WHOLE GRAMS -- all 58 `pet_weight`
-                    # values across the captures are integers. Going through
-                    # float() only to publish "2223.0 g" invents a decimal the
-                    # hardware never measured. Parsed as float first so a
-                    # numeric string still works.
-                    weight = round(float(w)) if w is not None else None
-                except (TypeError, ValueError):
-                    weight = None
+                # The scale reports WHOLE GRAMS -- all 58 `pet_weight`
+                # values across the captures are integers. Going through
+                # float() only to publish "2223.0 g" invents a decimal the
+                # hardware never measured. Parsed as float first so a
+                # numeric string still works.
+                w = pet_weight_of(content if isinstance(content, dict) else {})
+                weight = round(w) if w is not None else None
                 if latest.get("related_event"):
                     pet_in_ts = await session.scalar(
                         select(Event.ts)
@@ -915,12 +975,36 @@ class EventStore:
                         # digits of precision the inputs cannot support.
                         duration = round(max(0.0, last_visit_ts - pet_in_ts))
 
+            recent = await session.execute(
+                select(Event.event_type, Event.device_type, Event.content_json)
+                .where(*visit, Event.content_json.isnot(None))
+                .order_by(Event.ts.desc())
+                .limit(WEIGHT_MEDIAN_SAMPLES * 4))
+            weights: list[float] = []
+            for event_type, device_type, content_json in recent:
+                if not codes.is_visit_summary(event_type, device_type):
+                    continue
+                w = pet_weight_of(_as_dict(content_json))
+                if w is not None:
+                    weights.append(w)
+                if len(weights) >= WEIGHT_MEDIAN_SAMPLES:
+                    break
+            median_weight = round(statistics.median(weights)) if weights else None
+
+            last_drink_ts = await session.scalar(
+                select(func.max(Event.ts)).where(*drink))
+            drinks_today = await session.scalar(
+                select(func.count()).select_from(Event).where(*drink, Event.ts >= day_start))
+
         return {
             "last_visit_ts": last_visit_ts,
             "visits_today": visits_today,
             "last_visit_weight": weight,
             "last_visit_duration": duration,
             "last_device_id": device_id,
+            "weight": median_weight,
+            "last_drink_ts": last_drink_ts,
+            "drinks_today": drinks_today or 0,
         }
 
     async def pets_for_device(self, device_id: int) -> list[dict[str, Any]]:

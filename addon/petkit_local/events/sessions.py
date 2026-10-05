@@ -14,7 +14,7 @@ correcting — stays in readable Python rather than in SQL.
 from __future__ import annotations
 
 from petkit_local.events import codes
-from petkit_local.events.normalize import _as_dict, is_detail_event
+from petkit_local.events.normalize import _as_dict, is_detail_event, pet_weight_of
 from petkit_local.utils.coerce import to_float, to_int
 
 # --- visit-session grouping (Timeline tab) ------------------------------
@@ -59,8 +59,7 @@ def state_of_row(event: dict) -> dict:
 
 def _weight_of(event: dict) -> float | None:
     """The pet weight this event reported, in whatever unit the device sent."""
-    c = _content_of(event)
-    return to_float(c.get("pet_weight", c.get("petWeight")), None)
+    return pet_weight_of(_content_of(event))
 
 
 def _duration_of(anchor: dict, pet_in: dict | None) -> float | None:
@@ -142,6 +141,7 @@ def _session_from_visit(anchor: dict, pet_in: dict | None, media: list[dict]) ->
         "ts": anchor.get("ts"),
         "display_ts": _started_at(anchor, pet_in) or anchor.get("ts"),
         "pet_id": anchor.get("pet_id"),
+        "pet_source": anchor.get("pet_source"),
         "event_type": anchor.get("event_type"),
         "event_kind": codes.KIND_TOILET,
         "duration_sec": duration,
@@ -272,6 +272,7 @@ def _attach(session: dict, e: dict, used_ids: set) -> None:
     used_ids.add(e["id"])
     if session.get("pet_id") is None and e.get("pet_id") is not None:
         session["pet_id"] = e["pet_id"]
+        session["pet_source"] = e.get("pet_source")
     session["sub_events"].append({
         "id": e["id"], "event_type": e.get("event_type"), "ts": e.get("ts"),
         "related_event": e.get("related_event"),
@@ -462,6 +463,7 @@ def _standalone_rows(events: list[dict], used_ids: set) -> list[dict]:
             # the only time it has. Emitted anyway so every card has one shape.
             "display_ts": e.get("ts"),
             "pet_id": e.get("pet_id"),
+            "pet_source": e.get("pet_source"),
             "event_type": e.get("event_type"),
             "event_kind": e.get("event_kind"),
             "duration_sec": None,

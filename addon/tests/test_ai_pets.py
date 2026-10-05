@@ -283,3 +283,11 @@ def test_best_match_still_falls_back_when_score_info_is_empty():
     assert _extract_score({"score_info": [131]}) == 131
     assert _extract_score({"score_info": []}) is None
     assert _extract_pet_ref({"score_info": [], "petId": 7}) == 7
+
+
+async def test_weight_references_skip_unset_and_non_positive(pet_registry: PetRegistry):
+    a = await pet_registry.create("A", weight=5075)
+    await pet_registry.create("B")
+    await pet_registry.create("C", weight=0)
+    await pet_registry.create("D", weight=-3)
+    assert await pet_registry.weight_references() == {a["id"]: 5075.0}
