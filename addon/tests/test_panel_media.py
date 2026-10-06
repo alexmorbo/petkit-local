@@ -149,6 +149,21 @@ def test_session_media_urls_exposes_health_gallery():
     assert urls["health"] == ["Health/h1.jpg", "Health/h2.jpg"]
 
 
+def test_unstitched_timelapse_is_flagged_preview_pending():
+    media = [
+        {"category": "cloudDouble", "status": "ready", "media_path": "/root/.raw/a.mp4",
+         "stitch_state": None, "created_at": 1000.0},
+        {"category": "cloudDouble", "status": "ready", "media_path": "/root/.raw/b.mp4",
+         "stitch_state": None, "created_at": 1004.0},
+    ]
+    urls = _session_media_urls(media, "/root", now=1010.0)
+    assert urls["preview_url"] is None
+    assert urls["preview_pending"] is True
+    assert urls["video_pending"] is False  # fullVideo's flag is untouched
+    assert _session_media_urls([_stitched("cloudDouble", "/root/t.mp4")], "/root",
+                               now=9_999_999.0)["preview_pending"] is False
+
+
 def test_session_media_urls_skips_not_ready_media():
     media = [{"category": "fullVideo", "status": "pending", "media_path": "/root/x.mp4"}]
     urls = _session_media_urls(media, "/root")
@@ -913,5 +928,104 @@ async def test_timeline_filters_by_pet():
             # garbage is ignored, not a 500 — the view is exactly the unfiltered one
             bad = await (await c.get("/api/timeline?pet=notanid")).json()
             assert bad["counts"] == everything["counts"]
+        finally:
+            await c.close()
+
+
+# --- /api/pets/{id}/last-visit|last-drink[/poster] ---------------------------
+
+async def _pet_with_visit(store, pet_registry, media_root):
+    from petkit_local.events.codes import KIND_DRINKING
+    from tests._pet_media import add_episode, media
+    pet = await pet_registry.create("Mia")
+    await add_episode(store, media_root, "visit", pet_id=pet["id"], ts=1000.0, items=(
+        media("cloudDouble", "Purobot Ultra (T6 1)/Timelapse/v 1.mp4", stitch_state="stitched"),
+        media("eventImage", "Purobot Ultra (T6 1)/Snapshots/p 1.jpg"),
+    ))
+    await add_episode(store, media_root, "drink", pet_id=pet["id"], ts=2000.0,
+                      kind=KIND_DRINKING, device_id=4, event_type="drink_over", items=(
+                          media("fullVideo", "W7H/Playback/d.mp4", stitch_state="stitched"),))
+    return pet
+
+
+async def test_last_visit_redirects_relatively_to_the_timelapse():
+    from tests._pet_media import MP4
+    with tempfile.TemporaryDirectory() as tmp:
+        app, reg, device, store, retention, pet_registry, ha_publisher, media_root = _panel(tmp)
+        pet = await _pet_with_visit(store, pet_registry, media_root)
+        c = await _client(app)
+        try:
+            r = await c.get(f"/api/pets/{pet['id']}/last-visit", allow_redirects=False)
+            assert r.status == 302
+            # aiohttp re-normalizes the Location through yarl, which leaves
+            # parentheses (legal in a path) unescaped; spaces stay encoded.
+            assert r.headers["Location"] == \
+                "../../media/Purobot%20Ultra%20(T6%201)/Timelapse/v%201.mp4"
+            assert r.headers["Cache-Control"] == "no-store"
+
+            r = await c.get(f"/api/pets/{pet['id']}/last-visit")
+            assert r.status == 200
+            assert r.url.path == "/api/media/Purobot Ultra (T6 1)/Timelapse/v 1.mp4"
+            assert await r.read() == MP4
+
+            r = await c.get(f"/api/pets/{pet['id']}/last-visit/poster", allow_redirects=False)
+            assert r.status == 302
+            assert r.headers["Location"] == \
+                "../../../media/Purobot%20Ultra%20(T6%201)/Snapshots/p%201.jpg"
+            r = await c.get(f"/api/pets/{pet['id']}/last-visit/poster")
+            assert r.status == 200
+            assert r.headers["Content-Type"] == "image/jpeg"
+        finally:
+            await c.close()
+
+
+async def test_last_drink_resolves_the_drinking_episode():
+    with tempfile.TemporaryDirectory() as tmp:
+        app, reg, device, store, retention, pet_registry, ha_publisher, media_root = _panel(tmp)
+        pet = await _pet_with_visit(store, pet_registry, media_root)
+        c = await _client(app)
+        try:
+            r = await c.get(f"/api/pets/{pet['id']}/last-drink", allow_redirects=False)
+            assert r.status == 302
+            assert r.headers["Location"] == "../../media/W7H/Playback/d.mp4"
+            # No still uploaded: the poster falls back to the video's frame grab.
+            r = await c.get(f"/api/pets/{pet['id']}/last-drink/poster", allow_redirects=False)
+            assert r.headers["Location"] == "../../../media/thumb/W7H/Playback/d.mp4"
+        finally:
+            await c.close()
+
+
+async def test_last_visit_refusals_are_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        app, reg, device, store, retention, pet_registry, ha_publisher, media_root = _panel(tmp)
+        pet = await pet_registry.create("Nothing yet")
+        c = await _client(app)
+        try:
+            r = await c.get(f"/api/pets/{pet['id']}/last-visit", allow_redirects=False)
+            assert (r.status, await r.json()) == (404, {"error": "no toilet visit with media"})
+            r = await c.get(f"/api/pets/{pet['id']}/last-drink/poster", allow_redirects=False)
+            assert (r.status, await r.json()) == (404, {"error": "no drink with media"})
+            r = await c.get("/api/pets/999/last-visit", allow_redirects=False)
+            assert (r.status, await r.json()) == (404, {"error": "not found"})
+            r = await c.get("/api/pets/abc/last-visit", allow_redirects=False)
+            assert (r.status, await r.json()) == (400, {"error": "bad id"})
+        finally:
+            await c.close()
+
+
+async def test_media_file_answers_range_requests_with_206():
+    """What iOS Safari and the HA app need to play the redirect's target."""
+    with tempfile.TemporaryDirectory() as tmp:
+        app, reg, device, store, retention, pet_registry, ha_publisher, media_root = _panel(tmp)
+        target = Path(media_root) / "Device" / "Timelapse" / "v.mp4"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"0123456789")
+        c = await _client(app)
+        try:
+            r = await c.get("/api/media/Device/Timelapse/v.mp4", headers={"Range": "bytes=0-3"})
+            assert r.status == 206
+            assert r.headers["Content-Type"] == "video/mp4"
+            assert r.headers["Accept-Ranges"] == "bytes"
+            assert await r.read() == b"0123"
         finally:
             await c.close()

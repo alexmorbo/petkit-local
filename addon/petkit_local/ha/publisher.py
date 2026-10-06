@@ -33,17 +33,29 @@ from petkit_local.devices.registry import DeviceRegistry
 from petkit_local.ha.categories import get_entities_for_device, get_retired_entities_for_device
 from petkit_local.ha.command_router import CommandRouter
 from petkit_local.ha.entities.ble import get_ble_entities
-from petkit_local.ha.entities.pet import PET_SENSORS
+from petkit_local.ha.entities.pet import PET_IMAGE_BY_KIND, PET_SENSORS
 from petkit_local.ha.discovery import build_discovery_payload, discovery_topic, image_topic
 from petkit_local.devices.state_parsers import apply_consumable_state
 from petkit_local.ha.commands import LOCAL_DEFAULTS, multi_config_texts
+from petkit_local.events.codes import KIND_DRINKING, KIND_TOILET
+from petkit_local.media.pet_media import (
+    CLIP_SETTLE_SECONDS,
+    PENDING_GRACE_SECONDS,
+    PET_MEDIA_KINDS,
+    PetMedia,
+    media_url_path,
+    resolve_pet_media,
+)
+from petkit_local.media.thumbs import cached_video_thumb, thumb_cache_path
 from petkit_local.utils.jsonio import read_bytes
+from petkit_local.utils.paths import UnsafePathError, safe_join
 from petkit_local.utils.timeutil import local_day_bounds
 
 if TYPE_CHECKING:
     from petkit_local.ai.pets import PetRegistry
     from petkit_local.devices.ble import BLEDevice, BLERegistry
     from petkit_local.events.store import EventStore
+    from petkit_local.ha.discovery import EntityDef
     from petkit_local.mqtt.bridge import MQTTBridge
     from petkit_local.web.hub import EventHub
 
@@ -56,6 +68,21 @@ def _pet_state_topic(pet_id: int) -> str:
 
 def _pet_availability_topic(pet_id: int) -> str:
     return f"petkit-local/pet/{pet_id}/availability"
+
+
+def _pet_image_topic(pet_id: int, entity: EntityDef) -> str:
+    """Retained raw-JPEG topic of a pet `image` entity.
+
+    The `pet/` segment keeps it out of the device namespace that
+    `discovery.image_topic` would put it in (`petkit-local/{id}/...`), where
+    pet id 1 and device id 1 would share a topic. An integer device id can
+    never be `pet`.
+    """
+    return f"petkit-local/pet/{pet_id}/{entity.unique_id_suffix}"
+
+
+# HA's MQTT sensor rejects a state longer than this.
+_HA_STATE_MAX = 255
 
 
 def _device_topic(petkit_id: int, suffix: str) -> str:
@@ -116,8 +143,9 @@ class HAPublisher:
         Args:
             config: The add-on options dict. Read here: `ha_mqtt_host` (empty
                 disables HA publishing entirely), `ha_mqtt_port`,
-                `ha_mqtt_user`, `ha_mqtt_pass`, `ha_discovery_prefix` and
-                `media_root`. Every key is optional and defaulted, so a bare
+                `ha_mqtt_user`, `ha_mqtt_pass`, `ha_discovery_prefix`,
+                `media_root` and `data_dir` (the frame-grab cache of pet
+                images whose visit has no still). Every key is optional and defaulted, so a bare
                 `{}` yields a publisher that starts and immediately opts out.
             ble_registry: Omit when the install has no BLE accessories — the
                 BLE `publish_*` methods then simply do nothing.
@@ -138,6 +166,7 @@ class HAPublisher:
         self._password = config.get("ha_mqtt_pass", "")
         self._prefix = config.get("ha_discovery_prefix", "homeassistant")
         self._media_root = config.get("media_root", "/media/petkit")
+        self._data_dir = config.get("data_dir", "/data")
         self._client = None
         self._connected = False
         self._commands = CommandRouter(self, registry, ble_registry)
@@ -154,6 +183,31 @@ class HAPublisher:
         #: aiomqtt missing): the unpublish methods then queue nothing, since
         #: nothing would ever flush it, and answer None.
         self._enabled = bool(self._host)
+        #: `(pet_id, kind) -> absolute image path` last pushed to a pet image
+        #: (the poster, or the video's cached frame grab). Twenty weight
+        #: samples per visit each republish the pet's state; this is what stops
+        #: them re-reading and re-sending the same JPEG. Cleared on every
+        #: connect, so a broker that lost its retained bytes gets them again
+        #: from the reconnect's `publish_all_pets`.
+        self._pet_images_sent: dict[tuple[int, str], str] = {}
+        #: `(pet_id, kind) -> source path` whose image could not be produced
+        #: (unreadable still, failed or impossible frame grab). Remembered so
+        #: the same failure is logged and retried once per source, not on every
+        #: weight sample. Cleared with `_pet_images_sent`.
+        self._pet_images_failed: dict[tuple[int, str], str] = {}
+        #: Delayed pet-media refreshes per episode (`(device_id,
+        #: related_event)`), debounced to the episode's last upload. See
+        #: `_schedule_pet_media_settle`.
+        self._settle_tasks: dict[tuple[int | None, str], asyncio.Task] = {}
+        #: Consecutive sleeps after an episode's last upload, each followed by
+        #: a re-resolve. The first covers both a lone chunk turning playable
+        #: (stitch QUIET_SECONDS, 90) and a Clip-only visit settling
+        #: (CLIP_SETTLE_SECONDS, 180); the second a stuck tier no longer
+        #: counting as "assembling" (PENDING_GRACE_SECONDS after that tier's
+        #: last chunk). Nothing else fires at those moments. Public so tests
+        #: can shorten it.
+        self.pet_media_settle_delays: tuple[float, ...] = (
+            CLIP_SETTLE_SECONDS + 15, PENDING_GRACE_SECONDS + 15)
 
     @property
     def enabled(self) -> bool:
@@ -221,6 +275,10 @@ class HAPublisher:
                     self._client = client
                     self._connected = True
                     fails = 0
+                    # The broker may have lost the retained pet images; make the
+                    # replay below send every one of them again.
+                    self._pet_images_sent.clear()
+                    self._pet_images_failed.clear()
                     log.info("Connected to HA MQTT broker at %s:%d", self._host, self._port)
 
                     # Removals first, then what exists now -- so anything that
@@ -482,6 +540,22 @@ class HAPublisher:
             device.state["lastClipPath"] = self._relative_media_path(path)
             await self.publish_state(device)
 
+        # A pet's last-visit/last-drink entities may now point somewhere new.
+        # A still can change the picture of an already-shown visit at once.
+        # Videos change nothing on arrival: a chunk becomes playable only once
+        # stitched or settled, and a Clip only once the episode's uploads have
+        # been silent for CLIP_SETTLE_SECONDS. So every upload (re)arms the
+        # episode's settle timer, debounced to the last one, and a stitch
+        # refreshes sooner through `on_episode_stitched`.
+        rel = media.get("related_event")
+        if rel:
+            dev_id = media.get("device_id")
+            if category in ("eventImage", "wasteCheck"):
+                await self.refresh_pet_media(rel, dev_id)
+            if category in ("eventImage", "wasteCheck", "dynamicVideo", "highLight",
+                            "fullVideo", "cloudDouble"):
+                self._schedule_pet_media_settle(rel, dev_id)
+
     # --- per-pet virtual devices -------------------------------------------
 
     def _pet_identifiers(self, pet_id: int) -> list[str]:
@@ -496,6 +570,17 @@ class HAPublisher:
         """Every retained discovery config topic a pet's HA device uses."""
         ids = self._pet_identifiers(pet_id)
         return [discovery_topic(e, pet_id, self._prefix, identifiers=ids) for e in PET_SENSORS]
+
+    def _pet_clear_topics(self, pet_id: int) -> list[str]:
+        """Every retained topic a pet's HA device uses: each discovery config,
+        the raw bytes of its `image` entities, state, availability.
+
+        Configs first, as in `_device_clear_topics`, so HA drops an entity
+        before its retained bytes are emptied.
+        """
+        return (self._pet_config_topics(pet_id)
+                + [_pet_image_topic(pet_id, e) for e in PET_SENSORS if e.component == "image"]
+                + [_pet_state_topic(pet_id), _pet_availability_topic(pet_id)])
 
     def _ble_config_topics(self, ble_dev: BLEDevice) -> list[str]:
         """Every retained discovery config topic a BLE accessory's HA device uses."""
@@ -527,8 +612,10 @@ class HAPublisher:
         next connect; None means publishing is off (no broker configured), so
         there is nothing to remove and nothing is queued. Never raises.
         """
-        return await self._queue_clear(("pet", pet_id), self._pet_config_topics(pet_id) + [
-            _pet_state_topic(pet_id), _pet_availability_topic(pet_id)])
+        for cache in (self._pet_images_sent, self._pet_images_failed):
+            for key in [k for k in cache if k[0] == pet_id]:
+                del cache[key]
+        return await self._queue_clear(("pet", pet_id), self._pet_clear_topics(pet_id))
 
     async def unpublish_ble(self, ble_dev: BLEDevice) -> bool | None:
         """Remove an unpaired BLE accessory's HA device, like `unpublish_pet`."""
@@ -580,8 +667,7 @@ class HAPublisher:
         avail_topic = _pet_availability_topic(pet["id"])
         # Before the connection guard, so a pet published while offline still
         # cancels a tombstone the next connect would otherwise flush.
-        self._cancel_pending_clear(("pet", pet["id"]), self._pet_config_topics(pet["id"])
-                                   + [state_topic, avail_topic])
+        self._cancel_pending_clear(("pet", pet["id"]), self._pet_clear_topics(pet["id"]))
         if not self._client or not self._connected:
             return
         identifiers = self._pet_identifiers(pet["id"])
@@ -593,6 +679,8 @@ class HAPublisher:
                 device_name=pet["name"], serial_number=f"pet-{pet['id']}",
                 state_topic=state_topic, identifiers=identifiers,
                 availability_topic=avail_topic,
+                image_topic_override=(_pet_image_topic(pet["id"], entity)
+                                      if entity.component == "image" else None),
             )
             await self._emit(topic, json.dumps(payload), retain=True)
 
@@ -629,7 +717,147 @@ class HAPublisher:
                 "drinksToday": stats.get("drinks_today", 0),
             }
         }
+        media = {k: await self._resolve_pet_media(pet["id"], k, store) for k in PET_MEDIA_KINDS}
+        state["state"]["lastVisitVideo"] = self._video_state(media[KIND_TOILET])
+        state["state"]["lastDrinkVideo"] = self._video_state(media[KIND_DRINKING])
         await self._emit(_pet_state_topic(pet["id"]), json.dumps(state), retain=True)
+        await self._publish_pet_images(pet["id"], media)
+
+    async def _resolve_pet_media(self, pet_id: int, kind: str,
+                                 store: EventStore) -> PetMedia | None:
+        """`resolve_pet_media`, except that it never raises: a bad media row
+        must not cost the pet its visit counters."""
+        try:
+            return await resolve_pet_media(store, pet_id, kind, self._media_root)
+        except Exception:
+            log.warning("Resolving pet %d's last %s media failed", pet_id, kind, exc_info=True)
+            return None
+
+    @staticmethod
+    def _video_state(res: PetMedia | None) -> str | None:
+        """The `Last * Video` sensor value: the panel path the stable redirect
+        currently points at, or None (HA reads `None` as unknown) when there is
+        none or it would exceed HA's state length cap."""
+        if res is None:
+            return None
+        value = media_url_path(res.video)
+        return value if len(value) <= _HA_STATE_MAX else None
+
+    async def _publish_pet_images(self, pet_id: int, media: dict[str, PetMedia | None]) -> None:
+        """Push each resolved visit's picture to the pet's image topic.
+
+        The picture is the poster still, or, for a visit with none, a frame
+        grabbed from its video (the same cached grab the panel's
+        `/api/media/thumb/` serves) - otherwise the image would keep showing
+        the previous visit while the video sensor points at the new one. Only
+        when the picture changed since the last push (`_pet_images_sent`). A
+        kind that resolves to nothing, or whose picture cannot be produced,
+        publishes nothing: the last retained picture stays, which beats an
+        empty payload HA's image platform would reject.
+        """
+        for kind, res in media.items():
+            if res is None:
+                continue
+            key = (pet_id, kind)
+            try:
+                src = safe_join(self._media_root, res.poster or res.video)
+            except UnsafePathError:
+                continue
+            want = src if res.poster else thumb_cache_path(self._data_dir, src)
+            if self._pet_images_sent.get(key) == want or self._pet_images_failed.get(key) == src:
+                continue
+            path = src if res.poster else await self._video_frame(src)
+            if path is None:
+                self._pet_images_failed[key] = src
+                log.info("No picture for pet %d's last %s: no still, and no frame "
+                         "could be grabbed from %s", pet_id, kind, src)
+                continue
+            try:
+                data = await asyncio.to_thread(read_bytes, path)
+            except OSError as e:
+                self._pet_images_failed[key] = src
+                log.warning("Could not read pet %d's %s picture (%s): %s", pet_id, kind, path, e)
+                continue
+            if await self._emit(_pet_image_topic(pet_id, PET_IMAGE_BY_KIND[kind]), data,
+                                retain=True):
+                self._pet_images_sent[key] = path
+                self._pet_images_failed.pop(key, None)
+
+    async def _video_frame(self, video_path: str) -> str | None:
+        """The cached frame grab of `video_path`, or None (no ffmpeg, failed
+        grab). Never raises."""
+        try:
+            return await cached_video_thumb(self._data_dir, video_path)
+        except Exception:
+            log.debug("Frame grab of %s failed", video_path, exc_info=True)
+            return None
+
+    async def refresh_pet_media(self, related_event: str, device_id: int | None = None) -> None:
+        """Republish every pet one episode is attributed to. Never raises.
+
+        The entry point for media arriving or becoming playable after the
+        event row that `publish_pet_state` was first called for. `device_id`
+        narrows the episode to one device's rows, as the resolver does.
+        """
+        if self._pets is None or self._pet_store is None:
+            return
+        if not self._client or not self._connected or not related_event:
+            return
+        try:
+            for pid in await self._pet_store.pet_ids_for_related_event(related_event, device_id):
+                pet = await self._pets.get(pid)
+                if pet:
+                    await self.publish_pet_state(pet, self._pet_store)
+        except Exception:
+            log.warning("Refreshing pet media for episode %s failed", related_event,
+                        exc_info=True)
+
+    def _schedule_pet_media_settle(self, related_event: str,
+                                   device_id: int | None = None) -> None:
+        """Re-resolve an episode's pets once its uploads have had time to settle.
+
+        Debounced to the last upload: a new one cancels the pending timer. A
+        multi-chunk episode that stitches is refreshed sooner, by
+        `on_episode_stitched`; this covers what no hook fires for - a lone
+        chunk turning playable after QUIET_SECONDS, a Clip-only visit settling
+        after CLIP_SETTLE_SECONDS, and a failed stitch falling back a tier
+        after PENDING_GRACE_SECONDS. In memory only; a restart's reconnect
+        re-resolves every pet anyway.
+        """
+        key = (device_id, related_event)
+        old = self._settle_tasks.pop(key, None)
+        if old is not None:
+            old.cancel()
+        if not self.pet_media_settle_delays:
+            return
+        delays = self.pet_media_settle_delays
+
+        async def settle() -> None:
+            try:
+                for delay in delays:
+                    await asyncio.sleep(delay)
+                    await self.refresh_pet_media(related_event, device_id)
+            finally:
+                if self._settle_tasks.get(key) is task:
+                    del self._settle_tasks[key]
+
+        task = asyncio.create_task(settle(), name=f"pet-media-settle-{related_event}")
+        self._settle_tasks[key] = task
+
+    async def stop_pet_media_settles(self) -> None:
+        """Cancel every pending settle timer; called on shutdown, before the
+        event store they read is closed."""
+        tasks = list(self._settle_tasks.values())
+        self._settle_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def on_episode_stitched(self, episode: dict) -> None:
+        """`EpisodeStitcher`'s callback: a chunked recording just became
+        playable, so the pets of that episode may have a new last visit."""
+        await self.refresh_pet_media(episode.get("related_event") or "",
+                                     episode.get("device_id"))
 
     def _relative_media_path(self, path: str) -> str:
         """Path as HA's media browser addresses it: relative to the media root.

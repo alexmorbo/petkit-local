@@ -504,3 +504,35 @@ def test_claim_unique_path_never_hands_out_the_same_name_twice():
         assert second.endswith(" (2).mp4") and third.endswith(" (3).mp4")
         for p in (first, second, third):
             assert os.path.isfile(p)
+
+
+async def test_run_once_reports_each_successful_episode_once(monkeypatch, caplog):
+    """`on_stitched` is how HA's pet entities learn a visit became playable;
+    a failed episode must not fire it, and a failing callback must not stop
+    the sweep."""
+    episodes = [{"device_id": 1, "related_event": r, "category": "cloudDouble", "chunks": []}
+                for r in ("ok", "fails", "boom", "ok2")]
+
+    class Store:
+        async def stitch_candidates(self, categories, quiet_before_ts):
+            return episodes
+
+    async def fake_stitch(store, ep, media_root, work_dir, device_type):
+        if ep["related_event"] == "fails":
+            return None
+        return f"/m/{ep['related_event']}.mp4"
+
+    monkeypatch.setattr(stitch, "stitch_episode", fake_stitch)
+    seen = []
+
+    async def on_stitched(ep):
+        seen.append(ep["related_event"])
+        if ep["related_event"] == "boom":
+            raise RuntimeError("HA hiccup")
+
+    stitcher = stitch.EpisodeStitcher(Store(), None, "/m", "/m/.raw", on_stitched=on_stitched)
+    assert await stitcher.run_once() == 3
+    assert seen == ["ok", "boom", "ok2"]
+    # The join succeeded; only the callback failed, and the log says so.
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert msgs == ["Episode boom/cloudDouble stitched, but the on_stitched callback failed"]

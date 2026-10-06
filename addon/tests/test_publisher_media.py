@@ -116,3 +116,95 @@ async def test_publish_media_ready_skips_snapshot_for_video_only_category():
 
         topics = [t for t, _, _ in pub._client.published]
         assert "petkit-local/1/last_snapshot" not in topics
+
+
+async def _pet_wired(event_store, pet_registry, tmp):
+    from tests._pet_media import add_episode, media
+    reg, dev, pub = _setup(tmp)
+    pet = await pet_registry.create("Mia")
+    pub.set_pet_source(pet_registry, event_store)
+    await add_episode(event_store, tmp, "r1", pet_id=pet["id"], items=(
+        media("dynamicVideo", "T5/Clips/c.mp4"), media("eventImage", "T5/Snapshots/p.jpg")))
+    return pub, dev, pet
+
+
+def _pet_images(pub, pid):
+    return [t for t, _, _ in pub._client.published
+            if t == f"petkit-local/pet/{pid}/last_visit_image"]
+
+
+async def test_a_poster_landing_refreshes_its_pets_image(event_store, pet_registry, tmp_path):
+    tmp = str(tmp_path)
+    pub, dev, pet = await _pet_wired(event_store, pet_registry, tmp)
+    row = {"status": "ready", "category": "eventImage", "related_event": "r1",
+           "media_path": str(tmp_path / "T5/Snapshots/p.jpg")}
+    await pub.publish_media_ready(dev, row)
+    assert len(_pet_images(pub, pet["id"])) == 1
+    await pub.stop_pet_media_settles()
+
+
+async def test_a_chunk_refreshes_only_after_it_settles(event_store, pet_registry, tmp_path):
+    tmp = str(tmp_path)
+    pub, dev, pet = await _pet_wired(event_store, pet_registry, tmp)
+    pub.pet_media_settle_delays = (0,)
+    chunk = {"status": "ready", "category": "cloudDouble", "related_event": "r1",
+             "device_id": 1, "media_path": str(tmp_path / "T5/.raw/c1.mp4")}
+    await pub.publish_media_ready(dev, chunk)
+    assert _pet_images(pub, pet["id"]) == []  # nothing changes on a chunk's arrival
+    assert (1, "r1") in pub._settle_tasks
+    await pub._settle_tasks[(1, "r1")]
+    assert len(_pet_images(pub, pet["id"])) == 1
+    assert pub._settle_tasks == {}
+
+
+async def test_a_second_chunk_restarts_the_settle_timer(event_store, pet_registry, tmp_path):
+    tmp = str(tmp_path)
+    pub, dev, pet = await _pet_wired(event_store, pet_registry, tmp)
+    pub.pet_media_settle_delays = (3600,)
+    chunk = {"status": "ready", "category": "fullVideo", "related_event": "r1",
+             "device_id": 1, "media_path": str(tmp_path / "T5/.raw/c1.mp4")}
+    await pub.publish_media_ready(dev, chunk)
+    first = pub._settle_tasks[(1, "r1")]
+    await pub.publish_media_ready(dev, chunk)
+    second = pub._settle_tasks[(1, "r1")]
+    await asyncio.sleep(0)
+    assert first is not second and first.cancelled()
+    await pub.stop_pet_media_settles()
+    assert second.cancelled() and pub._settle_tasks == {}
+
+
+async def test_a_stitched_episode_refreshes_its_pets(event_store, pet_registry, tmp_path):
+    tmp = str(tmp_path)
+    pub, dev, pet = await _pet_wired(event_store, pet_registry, tmp)
+    await pub.on_episode_stitched({"related_event": "r1", "category": "cloudDouble"})
+    assert len(_pet_images(pub, pet["id"])) == 1
+
+
+async def test_a_clip_arms_the_settle_timer_without_refreshing(event_store, pet_registry, tmp_path):
+    """A Clip is accepted only once its episode has been silent for
+    CLIP_SETTLE_SECONDS, so its arrival changes nothing yet; the settle timer
+    must cover that, or a Clip-only visit would wait for the next weight sample."""
+    from petkit_local.media.pet_media import CLIP_SETTLE_SECONDS
+    tmp = str(tmp_path)
+    pub, dev, pet = await _pet_wired(event_store, pet_registry, tmp)
+    assert pub.pet_media_settle_delays[0] > CLIP_SETTLE_SECONDS
+    pub.pet_media_settle_delays = (3600,)
+    clip = {"status": "ready", "category": "dynamicVideo", "related_event": "r1",
+            "device_id": 1, "media_path": str(tmp_path / "T5/Clips/c.mp4")}
+    await pub.publish_media_ready(dev, clip)
+    assert _pet_images(pub, pet["id"]) == []
+    assert (1, "r1") in pub._settle_tasks
+    await pub.stop_pet_media_settles()
+
+
+async def test_a_refresh_only_reaches_pets_of_that_devices_episode(event_store, pet_registry,
+                                                                   tmp_path):
+    from tests._pet_media import add_episode, media
+    tmp = str(tmp_path)
+    pub, dev, pet = await _pet_wired(event_store, pet_registry, tmp)
+    other = await pet_registry.create("Leo")
+    await add_episode(event_store, tmp, "r1", pet_id=other["id"], device_id=2, items=(
+        media("dynamicVideo", "T6/Clips/c.mp4"), media("eventImage", "T6/Snapshots/p.jpg")))
+    await pub.on_episode_stitched({"related_event": "r1", "device_id": 1})
+    assert len(_pet_images(pub, pet["id"])) == 1
+    assert _pet_images(pub, other["id"]) == []

@@ -37,7 +37,7 @@ import os
 import re
 import shutil
 import time
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable
 
 from petkit_local.media import layout, transcode
 from petkit_local.media.transcode import STITCH_TIMEOUT, run_ffmpeg
@@ -475,7 +475,8 @@ class EpisodeStitcher:
     def __init__(self, store: EventStore, registry: DeviceRegistry | None,
                  media_root: str, work_dir: str,
                  interval: float = 60.0, quiet_seconds: float = QUIET_SECONDS,
-                 hub: EventHub | None = None) -> None:
+                 hub: EventHub | None = None,
+                 on_stitched: Callable[[dict], Awaitable[None]] | None = None) -> None:
         """`interval` and `quiet_seconds` are both in seconds and independent:
         the first is how often a pass runs, the second how long an episode
         must have been idle before that pass will touch it.
@@ -483,6 +484,10 @@ class EpisodeStitcher:
         `registry` is only consulted for a device's `device_type` (which names
         its folder in the friendly tree), so None degrades to an empty type
         rather than skipping the episode.
+
+        `on_stitched` is awaited with the episode after each successful join —
+        how HA's pet entities (`HAPublisher.on_episode_stitched`) learn a visit
+        became playable without this module importing `ha`.
         """
         self._store = store
         self._registry = registry
@@ -491,6 +496,7 @@ class EpisodeStitcher:
         self._interval = interval
         self._quiet = quiet_seconds
         self._hub = hub
+        self._on_stitched = on_stitched
 
     async def run_once(self) -> int:
         """Stitch every episode that has gone quiet; returns how many joined.
@@ -518,10 +524,21 @@ class EpisodeStitcher:
                         self._hub.publish("media", ep.get("device_id"),
                                           f"video ready: {os.path.basename(path)}",
                                           detail={"stitched": True, "category": ep.get("category")})
+                    if self._on_stitched is not None:
+                        await self._notify_stitched(ep)
             except Exception:
                 log.exception("Stitching episode %s/%s blew up",
                               ep.get("related_event"), ep.get("category"))
         return done
+
+    async def _notify_stitched(self, ep: dict) -> None:
+        """Await `on_stitched`, logging its failure as its own: the join itself
+        succeeded and must not be reported as a failed stitch."""
+        try:
+            await self._on_stitched(ep)
+        except Exception:
+            log.exception("Episode %s/%s stitched, but the on_stitched callback failed",
+                          ep.get("related_event"), ep.get("category"))
 
     async def run(self) -> None:
         """Sweep every `interval` seconds until cancelled.

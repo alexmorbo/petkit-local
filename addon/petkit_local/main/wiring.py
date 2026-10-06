@@ -175,6 +175,7 @@ def build_services(config: Config, args: argparse.Namespace) -> Services:
         "ha_mqtt_pass": config.ha_mqtt_pass,
         "ha_discovery_prefix": config.ha_discovery_prefix,
         "media_root": media_root,
+        "data_dir": config.data_dir,
     }, ble_registry=ble_registry, hub=hub)
 
     # Constructed here so every consumer below can be wired to it, but not yet

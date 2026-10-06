@@ -140,6 +140,7 @@ def build_discovery_payload(
     command_topic: str | None = None,
     identifiers: list[str] | None = None,
     availability_topic: str | None = None,
+    image_topic_override: str | None = None,
 ) -> dict[str, Any]:
     """Build the JSON config HA's MQTT discovery expects for one entity.
 
@@ -154,6 +155,12 @@ def build_discovery_payload(
             (e.g. pet id 1 vs. device id 1).
         command_topic: Overrides the per-entity default from
             `command_topic_for`; ignored for read-only components.
+        image_topic_override: Overrides `image_topic`'s
+            `petkit-local/{device_id}/...` for an `image` entity; ignored for
+            every other component. The image branch is the one place the
+            device namespace is hard-coded rather than derived from
+            `availability_topic`, so a per-pet image needs it to stay out of
+            the device id space (`petkit-local/pet/{id}/...`).
 
     Returns:
         A dict always carrying `name`, `unique_id`, `object_id`, `device`
@@ -260,7 +267,7 @@ def build_discovery_payload(
         # here directly: the bytes are the entity's whole content.
         payload.pop("value_template", None)
         payload.pop("state_topic", None)
-        payload["image_topic"] = image_topic(entity, device_id)
+        payload["image_topic"] = image_topic_override or image_topic(entity, device_id)
         payload["content_type"] = "image/jpeg"
 
     return payload

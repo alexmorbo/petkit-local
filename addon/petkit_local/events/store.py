@@ -690,22 +690,38 @@ class EventStore:
             stmt = stmt.where(Event.event_kind == event_kind)
         stmt = stmt.order_by(Event.ts.desc()).limit(limit)
 
-        media_by_related: dict[str, list[dict[str, Any]]] = {}
         async with self._read() as session:
             events = [e.as_dict() for e in await session.scalars(stmt)]
             # One extra query for the whole page rather than one per event.
-            related = sorted({e["related_event"] for e in events if e.get("related_event")})
-            if related:
-                rows = await session.scalars(
-                    select(Media)
-                    .where(Media.related_event.in_(related))
-                    .order_by(Media.created_at))
-                for media in rows:
-                    media_by_related.setdefault(media.related_event, []).append(media.as_dict())
+            media_by_related = await self._media_by_related(
+                session, [e["related_event"] for e in events if e.get("related_event")])
 
         for e in events:
             e["media"] = media_by_related.get(e.get("related_event") or "", [])
         return events
+
+    @staticmethod
+    async def _media_by_related(session: AsyncSession,
+                                related: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """Media rows of every episode in `related`, grouped by episode, each
+        list in `created_at` order. One `IN` query however many episodes."""
+        out: dict[str, list[dict[str, Any]]] = {}
+        keys = sorted({r for r in related if r})
+        if not keys:
+            return out
+        rows = await session.scalars(
+            select(Media).where(Media.related_event.in_(keys)).order_by(Media.created_at))
+        for media in rows:
+            out.setdefault(media.related_event, []).append(media.as_dict())
+        return out
+
+    async def media_for_related_events(self, related: list[str]) -> dict[str, list[dict[str, Any]]]:
+        """`{related_event: [media row, ...]}` for a batch of episodes.
+
+        An episode with no media has no key - read with `.get(rel, [])`.
+        """
+        async with self._read() as session:
+            return await self._media_by_related(session, related)
 
     # --- pets -------------------------------------------------------------
 
@@ -1006,6 +1022,48 @@ class EventStore:
             "last_drink_ts": last_drink_ts,
             "drinks_today": drinks_today or 0,
         }
+
+    async def pet_episodes(self, pet_id: int, event_kind: str,
+                           limit: int = 20) -> list[dict[str, Any]]:
+        """A pet's newest episodes of one kind, newest first.
+
+        Returns `[{related_event, device_id, ts, event_id}]`, one entry per
+        `(related_event, device_id)`: `ts` is the episode's latest report and
+        `event_id` its newest row. The row filter is `pet_visit_stats`' own
+        (`pet_id` AND `event_kind`), so a media lookup built on it always
+        belongs to a visit the "Last Visit" sensor also counts. Rows without a
+        `related_event` have no media to find and are left out.
+        """
+        newest_ts = func.max(Event.ts)
+        stmt = (
+            select(Event.related_event, Event.device_id, newest_ts.label("ts"),
+                   func.max(Event.id).label("event_id"))
+            .where(Event.pet_id == pet_id, Event.event_kind == event_kind,
+                   Event.related_event.is_not(None))
+            .group_by(Event.related_event, Event.device_id)
+            .order_by(newest_ts.desc())
+            .limit(limit))
+        async with self._read() as session:
+            return [dict(r) for r in (await session.execute(stmt)).mappings().all()]
+
+    async def pet_ids_for_related_event(self, related_event: str,
+                                        device_id: int | None = None) -> list[int]:
+        """Every pet any row of one episode is attributed to.
+
+        Reads the whole episode rather than its newest row (unlike
+        `PetRegistry.pet_for_related_event`): a media upload can land after a
+        later, unattributed report of the same session. `device_id` narrows it
+        to one device's episode, the key the resolver groups by.
+        """
+        if not related_event:
+            return []
+        stmt = (select(Event.pet_id).distinct()
+                .where(Event.related_event == related_event, Event.pet_id.is_not(None)))
+        if device_id is not None:
+            stmt = stmt.where(Event.device_id == device_id)
+        async with self._read() as session:
+            rows = await session.scalars(stmt)
+            return sorted(int(p) for p in rows)
 
     async def pets_for_device(self, device_id: int) -> list[dict[str, Any]]:
         """Pets linked to one device, filtered in Python rather than in SQL.

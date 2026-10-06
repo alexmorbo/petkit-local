@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +14,10 @@ from petkit_local.utils.timeutil import local_day_bounds
 from tests._fakes import FakeMqttClient
 
 
-def _setup():
+def _setup(media_root=None):
     reg = DeviceRegistry()
     dev = reg.get_or_create(petkit_id=1, device_type="t5", serial_number="SN")
-    pub = HAPublisher(reg, {})
+    pub = HAPublisher(reg, {"media_root": media_root} if media_root else {})
     pub._client = FakeMqttClient()
     pub._connected = True
     return reg, dev, pub
@@ -32,7 +33,14 @@ async def test_publish_pet_discovery_uses_distinct_identifiers_and_topics():
     assert configs, "expected at least one discovery config"
     for cfg in configs:
         assert cfg["device"]["identifiers"] == ["petkit_pet_1"]
-        assert cfg["state_topic"] == "petkit-local/pet/1/state"
+        if "image_topic" in cfg:
+            # Raw JPEG bytes on a pet topic, never the device namespace
+            # (`petkit-local/1/...` would be device id 1's).
+            assert cfg["image_topic"].startswith("petkit-local/pet/1/")
+            assert cfg["content_type"] == "image/jpeg"
+            assert "state_topic" not in cfg
+        else:
+            assert cfg["state_topic"] == "petkit-local/pet/1/state"
         assert cfg["availability"]["topic"] == "petkit-local/pet/1/availability"
         assert cfg["unique_id"].startswith("petkit_pet_1_")
 
@@ -162,7 +170,9 @@ async def test_pet_day_rollover_sleeps_until_just_after_local_midnight(monkeypat
 def _pet_clear_topics(pid):
     return {discovery_topic(e, pid, "homeassistant", identifiers=[f"petkit_pet_{pid}"])
             for e in PET_SENSORS} | {f"petkit-local/pet/{pid}/state",
-                                     f"petkit-local/pet/{pid}/availability"}
+                                     f"petkit-local/pet/{pid}/availability",
+                                     f"petkit-local/pet/{pid}/last_visit_image",
+                                     f"petkit-local/pet/{pid}/last_drink_image"}
 
 
 async def test_unpublish_pet_empties_every_config_and_its_state():
@@ -176,8 +186,13 @@ async def test_unpublish_pet_empties_every_config_and_its_state():
     sent = pub._client.published
     topics = {t for t, _, _ in sent}
     assert topics == _pet_clear_topics(7)
-    # Exactly what was announced, plus the two retained runtime topics.
+    # Exactly what was announced, plus the retained runtime topics.
     assert {t for t in topics if t.endswith("/config")} == announced
+    # Configs first, so HA drops each image entity before its bytes go.
+    order = [t for t, _, _ in sent]
+    last_config = max(i for i, t in enumerate(order) if t.endswith("/config"))
+    assert order.index("petkit-local/pet/7/last_visit_image") > last_config
+    assert order.index("petkit-local/pet/7/last_drink_image") > last_config
     assert "homeassistant/sensor/petkit_pet_7_last_visit/config" in topics
     assert "petkit-local/pet/7/state" in topics
     assert "petkit-local/pet/7/availability" in topics
@@ -385,3 +400,227 @@ async def test_publish_discovery_cancels_a_queued_device_removal():
 
     await pub.publish_discovery(dev)  # the same device registers again
     assert pub._pending_clears == {}
+
+
+# --- last visit / last drink media -------------------------------------------
+
+def _image_msgs(pub, pid, key="last_visit_image"):
+    return [(p, kw) for t, p, kw in pub._client.published
+            if t == f"petkit-local/pet/{pid}/{key}"]
+
+
+def _pet_state(pub, pid):
+    return json.loads([p for t, p, _ in pub._client.published
+                       if t == f"petkit-local/pet/{pid}/state"][-1])["state"]
+
+
+async def test_pet_image_discovery_uses_the_pet_image_topic():
+    reg, dev, pub = _setup()
+    await pub.publish_pet_discovery({"id": 1, "name": "Mia"})
+    configs = {json.loads(p)["unique_id"]: json.loads(p)
+               for t, p, _ in pub._client.published if t.endswith("/config")}
+    visit = configs["petkit_pet_1_last_visit_image"]
+    assert visit["image_topic"] == "petkit-local/pet/1/last_visit_image"
+    assert visit["content_type"] == "image/jpeg"
+    assert "state_topic" not in visit
+    assert configs["petkit_pet_1_last_drink_image"]["image_topic"] \
+        == "petkit-local/pet/1/last_drink_image"
+    assert configs["petkit_pet_1_last_visit_video"]["state_topic"] == "petkit-local/pet/1/state"
+    assert "homeassistant/image/petkit_pet_1_last_visit_image/config" in \
+        {t for t, _, _ in pub._client.published}
+
+
+async def test_pet_state_pushes_the_poster_once_and_names_the_video(event_store, tmp_path):
+    from tests._pet_media import JPEG, add_episode, media
+    root = str(tmp_path / "media")
+    reg, dev, pub = _setup(root)
+    await add_episode(event_store, root, "r1", pet_id=7, items=(
+        media("cloudDouble", "T5 (1)/Timelapse/v 1.mp4", stitch_state="stitched"),
+        media("eventImage", "T5 (1)/Snapshots/p.jpg"),
+    ))
+    pet = {"id": 7, "name": "Mia"}
+
+    await pub.publish_pet_state(pet, event_store)
+    [(data, kw)] = _image_msgs(pub, 7)
+    assert data == JPEG and kw["retain"] is True
+    state = _pet_state(pub, 7)
+    assert state["lastVisitVideo"] == "api/media/T5%20%281%29/Timelapse/v%201.mp4"
+    assert state["lastDrinkVideo"] is None
+    assert _image_msgs(pub, 7, "last_drink_image") == []
+
+    # Twenty weight samples per visit republish the state; the JPEG is not resent.
+    pub._client.published.clear()
+    await pub.publish_pet_state(pet, event_store)
+    assert _image_msgs(pub, 7) == []
+    assert _pet_state(pub, 7)["lastVisitVideo"] == state["lastVisitVideo"]
+
+
+async def test_a_reconnect_resends_the_pet_image(event_store, pet_registry, tmp_path):
+    from tests._pet_media import add_episode, media
+    root = str(tmp_path / "media")
+    reg, dev, pub = _setup(root)
+    pet = await pet_registry.create("Mia")
+    pub.set_pet_source(pet_registry, event_store)
+    await add_episode(event_store, root, "r1", pet_id=pet["id"], items=(
+        media("dynamicVideo", "T5/Clips/c.mp4"), media("eventImage", "T5/Snapshots/p.jpg")))
+    await pub.publish_all_pets()
+    assert len(_image_msgs(pub, pet["id"])) == 1
+
+    pub._client.published.clear()
+    await pub.publish_all_pets()
+    assert _image_msgs(pub, pet["id"]) == []
+
+    pub._pet_images_sent.clear()  # what start() does on every (re)connect
+    await pub.publish_all_pets()
+    assert len(_image_msgs(pub, pet["id"])) == 1
+
+
+async def test_a_new_visit_moves_the_image_to_it(event_store, tmp_path):
+    from tests._pet_media import add_episode, media
+    root = str(tmp_path / "media")
+    reg, dev, pub = _setup(root)
+    pet = {"id": 7, "name": "Mia"}
+    await add_episode(event_store, root, "old", pet_id=7, ts=1000.0, items=(
+        media("dynamicVideo", "T5/Clips/old.mp4"), media("eventImage", "T5/Snapshots/old.jpg")))
+    await pub.publish_pet_state(pet, event_store)
+    assert pub._pet_images_sent[(7, "toilet_visit")].endswith("old.jpg")
+
+    await add_episode(event_store, root, "new", pet_id=7, ts=2000.0, items=(
+        media("dynamicVideo", "T5/Clips/new.mp4"), media("eventImage", "T5/Snapshots/new.jpg")))
+    pub._client.published.clear()
+    await pub.publish_pet_state(pet, event_store)  # as bridge/stubs do for a new event
+    assert len(_image_msgs(pub, 7)) == 1
+    assert pub._pet_images_sent[(7, "toilet_visit")].endswith("new.jpg")
+    assert _pet_state(pub, 7)["lastVisitVideo"] == "api/media/T5/Clips/new.mp4"
+
+
+async def test_no_media_publishes_no_image(event_store):
+    reg, dev, pub = _setup()
+    await event_store.upsert_event({"device_id": 1, "event_type": "pet_out",
+                                    "event_kind": "toilet_visit", "pet_id": 7, "ts": 1000.0,
+                                    "related_event": "r1"})
+    await pub.publish_pet_state({"id": 7, "name": "Mia"}, event_store)
+    assert _image_msgs(pub, 7) == []
+    assert _pet_state(pub, 7)["lastVisitVideo"] is None
+
+
+async def test_a_resolver_failure_still_publishes_the_counters(event_store, monkeypatch):
+    reg, dev, pub = _setup()
+
+    async def broken(*a, **kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(publisher_mod, "resolve_pet_media", broken)
+    await pub.publish_pet_state({"id": 7, "name": "Mia"}, event_store)
+    state = _pet_state(pub, 7)
+    assert state["lastVisitVideo"] is None and "visitsToday" in state
+
+
+async def test_unpublish_pet_forgets_its_sent_images(event_store, tmp_path):
+    from tests._pet_media import add_episode, media
+    root = str(tmp_path / "media")
+    reg, dev, pub = _setup(root)
+    await add_episode(event_store, root, "r1", pet_id=7, items=(
+        media("dynamicVideo", "T5/Clips/c.mp4"), media("eventImage", "T5/Snapshots/p.jpg")))
+    await pub.publish_pet_state({"id": 7, "name": "Mia"}, event_store)
+    pub._pet_images_sent[(8, "toilet_visit")] = "/other"
+    pub._client.published.clear()
+
+    await pub.unpublish_pet(7)
+    cleared = {t for t, p, _ in pub._client.published if p == ""}
+    assert {"petkit-local/pet/7/last_visit_image", "petkit-local/pet/7/last_drink_image"} <= cleared
+    assert pub._pet_images_sent == {(8, "toilet_visit"): "/other"}
+
+
+def _pub_with(root, data_dir):
+    reg = DeviceRegistry()
+    pub = HAPublisher(reg, {"media_root": root, "data_dir": data_dir})
+    pub._client = FakeMqttClient()
+    pub._connected = True
+    return pub
+
+
+async def test_a_visit_without_a_still_publishes_a_frame_of_its_video(event_store, tmp_path,
+                                                                      monkeypatch):
+    from tests._pet_media import add_episode, media
+    root = str(tmp_path / "media")
+    pub = _pub_with(root, str(tmp_path / "data"))
+    await add_episode(event_store, root, "r1", pet_id=7, items=(
+        media("cloudDouble", "T5/Timelapse/v.mp4", stitch_state="stitched"),))
+    grabs = []
+
+    async def fake_thumb(data_dir, video_path):
+        grabs.append(video_path)
+        out = os.path.join(data_dir, "thumbs", "grab.jpg")
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(b"\xff\xd8frame")
+        return out
+
+    monkeypatch.setattr(publisher_mod, "cached_video_thumb", fake_thumb)
+    monkeypatch.setattr(publisher_mod, "thumb_cache_path",
+                        lambda d, v: os.path.join(d, "thumbs", "grab.jpg"))
+    pet = {"id": 7, "name": "Mia"}
+    await pub.publish_pet_state(pet, event_store)
+    [(data, kw)] = _image_msgs(pub, 7)
+    assert data == b"\xff\xd8frame" and kw["retain"] is True
+    assert grabs == [os.path.join(root, "T5/Timelapse/v.mp4")]
+    assert pub._pet_images_sent[(7, "toilet_visit")].endswith("grab.jpg")
+
+    # The next weight sample neither re-grabs nor re-sends.
+    pub._client.published.clear()
+    await pub.publish_pet_state(pet, event_store)
+    assert _image_msgs(pub, 7) == [] and len(grabs) == 1
+
+
+async def test_a_failed_frame_grab_publishes_nothing_and_is_not_retried(event_store, tmp_path,
+                                                                       monkeypatch, caplog):
+    from tests._pet_media import add_episode, media
+    root = str(tmp_path / "media")
+    pub = _pub_with(root, str(tmp_path / "data"))
+    await add_episode(event_store, root, "r1", pet_id=7, items=(
+        media("dynamicVideo", "T5/Clips/c.mp4"),))
+    calls = []
+
+    async def no_ffmpeg(data_dir, video_path):
+        calls.append(video_path)
+        return None
+
+    monkeypatch.setattr(publisher_mod, "cached_video_thumb", no_ffmpeg)
+    caplog.set_level("INFO", logger="petkit_local.ha.publisher")
+    pet = {"id": 7, "name": "Mia"}
+    for _ in range(3):
+        await pub.publish_pet_state(pet, event_store)
+    assert _image_msgs(pub, 7) == []
+    assert _pet_state(pub, 7)["lastVisitVideo"] == "api/media/T5/Clips/c.mp4"
+    assert len(calls) == 1
+    assert len([r for r in caplog.records if "No picture for pet 7" in r.message]) == 1
+
+
+async def test_an_unreadable_poster_is_logged_once(event_store, tmp_path, monkeypatch, caplog):
+    from tests._pet_media import add_episode, media
+    root = str(tmp_path / "media")
+    pub = _pub_with(root, str(tmp_path / "data"))
+    await add_episode(event_store, root, "r1", pet_id=7, items=(
+        media("dynamicVideo", "T5/Clips/c.mp4"), media("eventImage", "T5/Snapshots/p.jpg")))
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(publisher_mod, "read_bytes", unreadable)
+    pet = {"id": 7, "name": "Mia"}
+    for _ in range(3):
+        await pub.publish_pet_state(pet, event_store)
+    assert _image_msgs(pub, 7) == []
+    assert len([r for r in caplog.records if "Could not read pet 7" in r.message]) == 1
+
+
+def test_a_video_path_over_the_state_cap_reads_as_unknown():
+    from petkit_local.media.pet_media import PetMedia
+    long = PetMedia(pet_id=1, kind="toilet_visit", event_id=1, related_event="r",
+                    device_id=1, ts=0.0, video="T5/" + "x" * 300 + ".mp4", tier="clip",
+                    poster=None)
+    assert HAPublisher._video_state(long) is None
+    short = PetMedia(pet_id=1, kind="toilet_visit", event_id=1, related_event="r",
+                     device_id=1, ts=0.0, video="T5/c.mp4", tier="clip", poster=None)
+    assert HAPublisher._video_state(short) == "api/media/T5/c.mp4"

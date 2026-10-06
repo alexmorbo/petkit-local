@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Each pet's Home Assistant device now shows its last toilet visit and last
+  drink.** New entities: **Last Visit Snapshot** and **Last Drink Snapshot**
+  (images) and **Last Visit Video** and **Last Drink Video** (sensors holding
+  the panel path of the recording). The picture moves to a new visit only once
+  that visit's video is ready — assembled (about 2 minutes), or, for a
+  Clip-only visit, 3 minutes without further uploads — so it never shows a
+  half-processed visit or jumps back to an older one; a visit whose video
+  never assembles falls back to the next-best recording after 10 minutes, and
+  a visit without a still shows a frame of its video. New panel endpoints
+  `GET /api/pets/{id}/last-visit` and `/api/pets/{id}/last-drink` redirect
+  (302) to the Timelapse, else the Playback, else the Clip of that visit, and
+  `.../poster` to its still; they answer 404 when none of the pet's last 20
+  visits or drinks has a playable recording. Deleting a pet also clears these
+  entities.
+
 - **A pet can now be put on more devices from its card.** Pick a device next
   to its chips and press "Add device", or press the × on a chip to take it
   off. Nothing is pushed: the device reads its pet list at its next check

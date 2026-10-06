@@ -256,7 +256,8 @@ async def start_background(services: Services, app_instance: web.Application) ->
     # Joins each visit's rolling ~4s chunks into one continuous clip once
     # the episode goes quiet (see media/stitch.py).
     stitcher = EpisodeStitcher(event_store, registry, media_root,
-                               work_dir=f"{media_root}/.raw", hub=hub)
+                               work_dir=f"{media_root}/.raw", hub=hub,
+                               on_stitched=ha_publisher.on_episode_stitched if ha_publisher else None)
     _spawn(app_instance, "episode-stitcher", stitcher.run())
 
     if not services.no_mqtt:
@@ -328,6 +329,10 @@ async def cleanup_background(services: Services, app_instance: web.Application) 
 
     await _stop_tasks(app_instance[BACKGROUND_TASKS])
     app_instance[BACKGROUND_TASKS].clear()
+    # The publisher's pet-media settle timers are its own tasks, not `_spawn`ed
+    # ones, and they read the event store.
+    if services.ha_publisher:
+        await services.ha_publisher.stop_pet_media_settles()
 
     # The supervisor spawned these, so cancelling it does not close them —
     # they are per-device tasks of their own, holding live TLS connections

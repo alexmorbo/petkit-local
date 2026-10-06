@@ -181,6 +181,39 @@ never changes the reference, so a wrong match cannot drift it.
   accessory or deleting a device removes theirs). If HA's broker is down at the
   time, it happens when the add-on reconnects to it.
 
+**Last visit and last drink.** Each pet also gets **Last Visit Snapshot** and
+**Last Drink Snapshot** images — the still of its newest toilet visit / drink
+that has a playable video (a frame of that video when the device took no
+still) — and **Last Visit Video** / **Last Drink Video** sensors naming that
+recording.
+
+- The picture moves to a new visit only once that visit's video is ready: a
+  Timelapse or Playback once it is assembled (about 2 minutes after the cat
+  leaves), a visit with only a Clip once nothing has arrived for it for 3
+  minutes. Until then it keeps showing the previous visit, so it never shows a
+  half-processed one or jumps back. If assembling fails, it falls back to the
+  next recording of the same visit after 10 minutes.
+- The video played is the **Timelapse**, else the **Playback**, else the
+  **Clip**. A W7H drink recorded before Timelapse was switched on plays the
+  Playback.
+- Two stable URLs always open the newest one, for a dashboard tap action or a
+  bookmark: `/api/pets/<id>/last-visit` and `/api/pets/<id>/last-drink` (the
+  pet id is in the Pets tab). Add `/poster` for the still. They redirect to
+  the file, and answer 404 when none of the pet's last 20 visits / drinks has
+  a playable recording (retention removed them, or none has arrived yet).
+
+  ```yaml
+  type: picture-entity
+  entity: image.mia_last_visit_snapshot
+  tap_action:
+    action: url
+    url_path: https://<your panel host>/api/pets/2/last-visit
+  ```
+
+  The phone has to reach the panel directly — through your own reverse proxy or
+  the panel's port. HA's Ingress URL needs a Home Assistant login, so it works
+  only inside the HA app.
+
 ## Provisioning over Bluetooth
 
 The **Provision** tab hands a device its Wi-Fi credentials, a custom `apiServers`

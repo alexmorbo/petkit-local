@@ -1,4 +1,4 @@
-"""HA sensors for a per-pet virtual device — the pet, not the hardware.
+"""HA entities for a per-pet virtual device — the pet, not the hardware.
 
 A household with two cats and one litter box wants per-cat history, which no
 device entity can express. `ai/pets.py::PetRegistry` owns the pets and
@@ -10,8 +10,20 @@ sensors.
 Unlike every other list here these do NOT go through `ha/categories.py`:
 they belong to no device type, and unlike a device the values are not reported
 by anything — `publish_pet_state` recomputes all of them from the event store.
+
+The list keeps its historical name although it now holds images too: the two
+`image` entities carry no `value_path`, because they are fed raw JPEG bytes on
+their own retained topic (`ha/publisher.py::_publish_pet_images`) rather than
+read out of the state document. The poster and the `Last * Video` path come
+from the same resolver (`media/pet_media.py`), so they always show one visit.
 """
+from petkit_local.events import codes
 from petkit_local.ha.discovery import EntityDef
+
+LAST_VISIT_IMAGE = EntityDef(component="image", key="last_visit_image",
+                             name="Last Visit Snapshot", icon="mdi:cat")
+LAST_DRINK_IMAGE = EntityDef(component="image", key="last_drink_image",
+                             name="Last Drink Snapshot", icon="mdi:cup-water")
 
 PET_SENSORS = [
     EntityDef(component="sensor", key="last_visit", name="Last Visit",
@@ -36,4 +48,17 @@ PET_SENSORS = [
               value_path="state.lastDrink", device_class="timestamp", icon="mdi:cup-water"),
     EntityDef(component="sensor", key="drinks_today", name="Drinks Today",
               value_path="state.drinksToday", icon="mdi:counter"),
+    LAST_VISIT_IMAGE,
+    LAST_DRINK_IMAGE,
+    # The panel path (`api/media/<encoded rel>`) the stable
+    # `/api/pets/{id}/last-visit|last-drink` URL currently redirects to. It
+    # changes exactly when a new playable recording becomes the latest, which
+    # `last_visit` (set when the event row lands, minutes before the video
+    # exists) cannot signal.
+    EntityDef(component="sensor", key="last_visit_video", name="Last Visit Video",
+              value_path="state.lastVisitVideo", icon="mdi:filmstrip"),
+    EntityDef(component="sensor", key="last_drink_video", name="Last Drink Video",
+              value_path="state.lastDrinkVideo", icon="mdi:filmstrip"),
 ]
+
+PET_IMAGE_BY_KIND = {codes.KIND_TOILET: LAST_VISIT_IMAGE, codes.KIND_DRINKING: LAST_DRINK_IMAGE}

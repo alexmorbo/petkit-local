@@ -74,6 +74,21 @@ def test_image_uses_image_topic_not_url():
         assert "state_topic" not in p
 
 
+def test_image_topic_override_wins_over_the_device_namespace():
+    from petkit_local.ha.entities.pet import LAST_VISIT_IMAGE
+    p = build_discovery_payload(
+        entity=LAST_VISIT_IMAGE, device_id=1, device_type="pet", device_name="Mia",
+        serial_number="pet-1", state_topic="petkit-local/pet/1/state",
+        identifiers=["petkit_pet_1"], image_topic_override="petkit-local/pet/1/last_visit_image")
+    assert p["image_topic"] == "petkit-local/pet/1/last_visit_image"
+    # Ignored for anything that is not an image.
+    d = Device(device_type="t5", petkit_id=1, serial_number="SN")
+    sensor = next(e for e in get_entities_for_device(d) if e.component == "sensor")
+    q = build_discovery_payload(entity=sensor, device_id=1, device_type="t5", device_name="d",
+                                serial_number="SN", state_topic="s", image_topic_override="x")
+    assert "image_topic" not in q
+
+
 def test_discovery_topic_format():
     d = Device(device_type="t5", petkit_id=42, serial_number="SN")
     e = get_entities_for_device(d)[0]

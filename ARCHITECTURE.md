@@ -46,6 +46,7 @@ petkit_local/
 │                  normalize.py transport -> row · sessions.py rows -> visits
 │                  store.py SQLAlchemy async · models.py · migrations.py
 ├── media/         pipeline.py decrypt -> remux -> path -> row · stitch.py joins ~4s chunks
+│                  slots.py what is ready to play · pet_media.py a pet's last visit/drink
 │                  crypto · transcode · layout · retention · go2rtc
 ├── web/           panel.py the application + the whole route table · api/ the JSON handlers
 │                  appkeys.py the app[...] contract · hub.py event ring/WS · static/ · templates/
@@ -141,9 +142,15 @@ subscribes to raises nothing, so a stale `True` does not fail — it swallows th
 A device uploads to `http/bucket.py` under a key it chose. `media/pipeline.py` decrypts it, remuxes
 it, gives it a path a human can read, and records a row. Recordings arrive as many ~4-second chunks;
 `media/stitch.py` joins each episode into one file and deletes the sources only after verifying the
-result. `media/go2rtc.py` runs go2rtc in front of the device's own stream, because the device
-refuses a second connection for several seconds and because Home Assistant's camera stack segfaults
-reading its FLV directly.
+result. `media/slots.py` decides which of an episode's files is ready to play (the Timeline's
+rule), and `media/pet_media.py` uses it to pick a pet's last playable visit or drink for both the
+panel's `/api/pets/{id}/last-visit|last-drink` redirects and the pet's HA entities; the stitcher
+tells the HA publisher through a callback, so `media` never imports `ha`. `media/thumbs.py` is the
+cached ffmpeg frame grab both the panel's thumbnails and those entities use.
+
+`media/go2rtc.py` runs go2rtc in front of the device's own stream, because the device refuses a
+second connection for several seconds and because Home Assistant's camera stack segfaults reading
+its FLV directly.
 
 ## Where the knowledge lives
 

@@ -63,6 +63,7 @@ from petkit_local.web.api.logs import (
 )
 from petkit_local.web.api.media import api_media_file, api_media_thumb
 from petkit_local.web.api.patchers import api_patcher_apply, api_patcher_status
+from petkit_local.web.api.pet_media import api_pet_last_media, api_pet_last_media_poster
 from petkit_local.web.api.pets import (
     api_pet_detail, api_pet_face_detail, api_pet_face_photo, api_pet_faces,
     api_pets_import, api_pets_list_create, api_pets_unbound,
@@ -282,6 +283,11 @@ def create_panel_app(registry: DeviceRegistry, ble_registry: BLERegistry | None,
     app.router.add_post("/api/pets/{id}/faces", api_pet_faces)
     app.router.add_delete("/api/pets/{id}/faces/{face_id}", api_pet_face_detail)
     app.router.add_get("/api/pets/{id}/faces/{face_id}/photo", api_pet_face_photo)
+    # Stable "newest recording" URLs; both 302 to /api/media/... (see
+    # web/api/pet_media.py). The regex keeps them clear of `faces`.
+    app.router.add_get(r"/api/pets/{id}/{which:last-visit|last-drink}", api_pet_last_media)
+    app.router.add_get(r"/api/pets/{id}/{which:last-visit|last-drink}/poster",
+                       api_pet_last_media_poster)
     return app
 
 

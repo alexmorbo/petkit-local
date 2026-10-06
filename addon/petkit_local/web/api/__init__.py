@@ -18,7 +18,8 @@ control:
 * **Patchers** — apply/remove the on-device binary patches (`api_patcher_*`),
   which run as long-lived background tasks and report progress via the hub.
 * **Pets** — CRUD and reference face photos for on-device recognition
-  (`api_pets_*`).
+  (`api_pets_*`), and stable redirects to each pet's last visit / last drink
+  recording (`api_pet_last_media*`).
 * **Provisioning** — the Web Bluetooth page is pure frontend; it talks to the
   device directly from the browser, so there is no route for it here.
 
@@ -32,10 +33,11 @@ Which module owns what
 `devices.py`    the device list, the device detail and everything it inlines,
                 the manual command sender, the per-device toggles
 `schedules.py`  the schedule editors' one write endpoint and its validators
-`media.py`      serving the friendly media tree, thumbnails, and the role ->
-                slot mapping the Timeline renders from
+`media.py`      serving the friendly media tree and thumbnails (the role ->
+                slot mapping it re-exports lives in `media/slots.py`)
 `timeline.py`   the grouped day view and one event's stored detail
 `pets.py`       pet CRUD, reference face photos, and the cloud import
+`pet_media.py`  `/api/pets/{id}/last-visit|last-drink[/poster]` redirects
 `ble.py`        the BLE accessories: pairing, commands, cloud import
 `patchers.py`   applying and removing the on-device binary patches
 `logs.py`       the live event ring and WebSocket, the capture browser and the
