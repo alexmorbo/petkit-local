@@ -426,13 +426,15 @@ def test_the_job_buttons_send_actions_the_firmware_accepts():
     """A `start_action` outside the whitelist is discarded by the device with
     no reply, no error and no log — indistinguishable from a lost command.
 
-    The values are the official app's (capture 2026-10-04)."""
+    The values are the official app's (capture 2026-10-04; deep clean from a
+    later one, 2026-11)."""
     from petkit_local.ha.commands import ALL_ACTIONS
 
     device = Device(device_type="w7h", petkit_id=1, serial_number="W")
     for key, expected in [("fountain_flush", 1),
                           ("fountain_refill", 2),
-                          ("fountain_drain", 3)]:
+                          ("fountain_drain", 3),
+                          ("fountain_deep_clean", 4)]:
         suffix, envelope = ALL_ACTIONS[key](device)
         assert suffix == "start"
         assert envelope["method"] == "thing.service.start"
@@ -447,7 +449,8 @@ def test_no_button_sends_an_action_that_is_not_a_job():
     from petkit_local.ha.commands import ALL_ACTIONS
 
     device = Device(device_type="w7h", petkit_id=1, serial_number="W")
-    for key in ("fountain_flush", "fountain_refill", "fountain_drain"):
+    for key in ("fountain_flush", "fountain_refill", "fountain_drain",
+                "fountain_deep_clean"):
         _, envelope = ALL_ACTIONS[key](device)
         assert envelope["params"]["start_action"] \
             not in codes.FOUNTAIN_W7H_START_ACTIONS_NOT_WORK
@@ -574,7 +577,7 @@ def test_no_action_anywhere_sends_start_action_5_to_a_w7h():
 
 
 def test_only_an_app_action_can_be_built():
-    """Accepted by the firmware is not enough; 4 is on its list too and no
+    """Accepted by the firmware is not enough; 9 is on its list too and no
     screen of the app sends it."""
     from petkit_local.ha.commands import _fountain_start
 
@@ -583,10 +586,11 @@ def test_only_an_app_action_can_be_built():
             _fountain_start(value)
 
 
-def test_the_w7h_buttons_are_exactly_the_apps_three_jobs():
+def test_the_w7h_buttons_are_exactly_the_apps_jobs_and_the_pump_reset():
     _, idx = _w7h_index()
     buttons = sorted(k for k, e in idx.items() if e.component == "button")
-    assert buttons == ["fountain_drain", "fountain_flush", "fountain_refill"]
+    assert buttons == ["fountain_deep_clean", "fountain_drain", "fountain_flush",
+                       "fountain_refill", "fountain_reset_circulation_pump"]
 
 
 def test_controls_the_app_does_not_have_are_gone():

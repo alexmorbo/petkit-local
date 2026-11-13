@@ -73,7 +73,9 @@ EXPECTED_ENTITY_COUNTS = {
     # (feed_picture, eat_video, voice_prompt, voice_disturb_mode, disturb_mode)
     # and added selected_sound number + play_sound button. Net +6.
     "d4h": 57, "d4sh": 61,
-    "w4": 24, "w5": 24, "ctw2": 24, "ctw3": 24, "w7h": 81,
+    # w7h +5: the deep clean and pump-reset buttons, and the deep-clean
+    # stage, last-run and result sensors.
+    "w4": 24, "w5": 24, "ctw2": 24, "ctw3": 24, "w7h": 86,
     "k2": 12, "k3": 12,
 }
 

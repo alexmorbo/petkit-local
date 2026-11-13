@@ -349,7 +349,7 @@ CATEGORY_SPECS: dict[str, CategorySpec] = {
         # and `add_water_over` a second after a `drink_start`; neither is a
         # thing any other EverSweet does, so neither belongs on the shared list.
         model_state_topics=(
-            ("w7h", ("work_start", "add_water_over")),
+            ("w7h", ("work_start", "add_water_over", "disinfect_over")),
         ),
         # Everything the W7H cannot fill. The list above is what it reports
         # instead; between the two, the fountain family covers both hardware
@@ -386,8 +386,9 @@ CATEGORY_SPECS: dict[str, CategorySpec] = {
                 # It is a SERVICE, though: `parse_service_invoke_msg` accepts
                 # `type: "power"` with a `power_action` of 0 or 1. That is the
                 # device off and on, not a running job paused, so these two
-                # stay excluded; what replaced them are the three job buttons
-                # in `FOUNTAIN_W7H_BUTTONS`, which use the `start` service.
+                # stay excluded; what replaced them are the job buttons
+                # in `FOUNTAIN_W7H_BUTTONS`, which use the `start` service
+                # (and `reset_cycle_pump`, for the pump-reset button).
                 "pause_fountain", "resume_fountain",
                 # Real set handlers (`codes.FOUNTAIN_W7H_SET_FIELDS`) that the
                 # official app offers on none of its screens
